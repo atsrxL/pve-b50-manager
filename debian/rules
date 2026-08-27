@@ -3,31 +3,9 @@
 	dh $@
 
 override_dh_auto_install:
-	# Perl module
-	install -D -m 0644 src/PVE/API2/Hardware/GPU.pm \
-		$(CURDIR)/debian/pve-gpu-manager/usr/share/perl5/PVE/API2/Hardware/GPU.pm
-	install -D -m 0644 src/PVE/API2/Hardware/GPU/Intel.pm \
-		$(CURDIR)/debian/pve-gpu-manager/usr/share/perl5/PVE/API2/Hardware/GPU/Intel.pm
-	install -D -m 0644 src/PVE/API2/Hardware/GPU/Nvidia.pm \
-		$(CURDIR)/debian/pve-gpu-manager/usr/share/perl5/PVE/API2/Hardware/GPU/Nvidia.pm
-	# JavaScript plugin
-	install -D -m 0644 src/js/pve-gpu-plugin.js \
-		$(CURDIR)/debian/pve-gpu-manager/usr/share/pve-manager/js/pve-gpu-plugin.js
-	# Scripts
-	install -D -m 0755 src/scripts/apply-sriov-config.sh \
-		$(CURDIR)/debian/pve-gpu-manager/usr/lib/pve-gpu/apply-sriov-config.sh
-	install -D -m 0755 src/scripts/apply-vfio-config.sh \
-		$(CURDIR)/debian/pve-gpu-manager/usr/lib/pve-gpu/apply-vfio-config.sh
-	install -D -m 0755 src/scripts/reapply-patches.sh \
-		$(CURDIR)/debian/pve-gpu-manager/usr/lib/pve-gpu/reapply-patches.sh
-	# Systemd service
-	install -D -m 0644 src/systemd/pve-gpu-sriov.service \
-		$(CURDIR)/debian/pve-gpu-manager/lib/systemd/system/pve-gpu-sriov.service
-	install -D -m 0644 src/systemd/pve-gpu-vfio.service \
-		$(CURDIR)/debian/pve-gpu-manager/lib/systemd/system/pve-gpu-vfio.service
-	# Default templates (staged; postinst copies to /etc/pve/local/)
-	install -D -m 0644 config/gpu-vf-templates.conf \
-		$(CURDIR)/debian/pve-gpu-manager/usr/share/pve-gpu/gpu-vf-templates.conf
-	# APT hook
-	install -D -m 0644 config/99-pve-gpu-reapply \
-		$(CURDIR)/debian/pve-gpu-manager/etc/apt/apt.conf.d/99-pve-gpu-reapply
+	$(MAKE) install DESTDIR=$(CURDIR)/debian/pve-gpu-manager
+
+# Both services are enabled by postinst but must never run merely because a
+# package was installed or upgraded; each can change a live PCI topology.
+override_dh_installsystemd:
+	dh_installsystemd --no-start

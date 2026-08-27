@@ -1,57 +1,36 @@
 #!/bin/sh
-# prerm: restore original PVE files and disable systemd service
+# Remove only this package's marked integration on final removal.
+
 set -e
 
-INDEX_TPL="/usr/share/pve-manager/index.html.tpl"
-HARDWARE_PM="/usr/share/perl5/PVE/API2/Hardware.pm"
+PATCH_SCRIPT=/usr/lib/pve-gpu/reapply-patches.sh
 
 log() {
-    logger -t pve-gpu-prerm "$@" || true
+    logger -t pve-gpu-prerm "$@" 2>/dev/null || true
     echo "pve-gpu-prerm: $*"
 }
 
-restore_backup() {
-    local file="$1"
-    local backup="${file}.pre-gpu"
-    if [ -f "$backup" ]; then
-        cp -p "$backup" "$file"
-        chmod 644 "$file" 2>/dev/null || true
-        log "Restored $file from $backup"
-    else
-        log "No backup found for $file, skipping restore"
-    fi
-}
+disable_services() {
+    command -v systemctl >/dev/null 2>&1 || return 0
 
-disable_service() {
-    if command -v systemctl >/dev/null 2>&1; then
-        systemctl stop pve-gpu-sriov.service 2>/dev/null || true
-        systemctl disable pve-gpu-sriov.service 2>/dev/null || true
-        log "Disabled pve-gpu-sriov.service"
-        systemctl stop pve-gpu-vfio.service 2>/dev/null || true
-        systemctl disable pve-gpu-vfio.service 2>/dev/null || true
-        log "Disabled pve-gpu-vfio.service"
-        if [ "$1" = "remove" ]; then
-            rm -f /etc/modprobe.d/pve-gpu-vfio.conf
-            rm -f /etc/modules-load.d/pve-gpu-vfio.conf
-            rm -f /etc/pve-gpu-vfio.conf
-            log "Cleaned up VFIO config files"
-        fi
-    fi
-}
-
-restart_pveproxy() {
-    if command -v systemctl >/dev/null 2>&1; then
-        systemctl restart pveproxy 2>/dev/null || log "WARNING: Failed to restart pveproxy"
-        log "Restarted pveproxy"
-    fi
+    systemctl stop pve-gpu-sriov.service 2>/dev/null || true
+    systemctl disable pve-gpu-sriov.service 2>/dev/null || true
+    systemctl stop pve-gpu-vfio.service 2>/dev/null || true
+    systemctl disable pve-gpu-vfio.service 2>/dev/null || true
+    log "Stopped and disabled PVE GPU Manager services"
 }
 
 case "$1" in
-    remove|upgrade|deconfigure)
-        restore_backup "$INDEX_TPL"
-        restore_backup "$HARDWARE_PM"
-        disable_service
-        restart_pveproxy
+    remove|deconfigure)
+        if [ -x "$PATCH_SCRIPT" ]; then
+            "$PATCH_SCRIPT" --remove
+        else
+            log "WARNING: $PATCH_SCRIPT unavailable; marked integration could not be removed"
+        fi
+        disable_services
+        ;;
+    upgrade)
+        # Keep the integration and services intact while dpkg replaces files.
         ;;
     failed-upgrade)
         ;;

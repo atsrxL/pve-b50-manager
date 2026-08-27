@@ -1,145 +1,36 @@
 #!/bin/sh
-# postinst: apply PVE GPU Manager patches and enable systemd service
+# Install the marked PVE integration and enable boot-time services.
+
 set -e
 
-INDEX_TPL="/usr/share/pve-manager/index.html.tpl"
-HARDWARE_PM="/usr/share/perl5/PVE/API2/Hardware.pm"
-SCRIPT_TAG='<script src="/pve2/js/pve-gpu-plugin.js"></script>'
-USE_STMT='use PVE::API2::Hardware::GPU;'
-
-APPLIED=0
+PATCH_SCRIPT=/usr/lib/pve-gpu/reapply-patches.sh
 
 log() {
-    logger -t pve-gpu-postinst "$@" || true
+    logger -t pve-gpu-postinst "$@" 2>/dev/null || true
     echo "pve-gpu-postinst: $*"
 }
 
-backup_if_needed() {
-    local file="$1"
-    local backup="${file}.pre-gpu"
-    if [ ! -f "$backup" ] && [ -f "$file" ]; then
-        cp "$file" "$backup"
-        log "Backed up $file -> $backup"
-    fi
-}
+enable_services() {
+    command -v systemctl >/dev/null 2>&1 || return 0
 
-patch_index_html() {
-    if [ ! -f "$INDEX_TPL" ]; then
-        log "WARNING: $INDEX_TPL not found, skipping"
-        return 0
-    fi
-
-    if grep -qF "$SCRIPT_TAG" "$INDEX_TPL"; then
-        log "index.html.tpl already patched"
-        return 0
-    fi
-
-    backup_if_needed "$INDEX_TPL"
-
-    local tmp
-    tmp=$(mktemp)
-    sed "s|</head>|${SCRIPT_TAG}\n</head>|" "$INDEX_TPL" > "$tmp"
-    mv "$tmp" "$INDEX_TPL"
-    chmod 644 "$INDEX_TPL"
-    log "Patched $INDEX_TPL: inserted script tag before </head>"
-    APPLIED=1
-}
-
-patch_hardware_pm() {
-    if [ ! -f "$HARDWARE_PM" ]; then
-        log "WARNING: $HARDWARE_PM not found, skipping"
-        return 0
-    fi
-
-    if grep -qF "PVE::API2::Hardware::GPU" "$HARDWARE_PM"; then
-        log "Hardware.pm already patched"
-        return 0
-    fi
-
-    backup_if_needed "$HARDWARE_PM"
-
-    local tmp
-    tmp=$(mktemp)
-
-    # Insert use statement after other use PVE::API2::Hardware:: lines,
-    # insert register_method after other register_method calls,
-    # and add { type => 'gpu' } to the index array
-    awk '
-        # Track where to insert the use statement
-        /^use PVE::API2::Hardware::/ { last_use = NR }
-
-        # Track where to insert register_method
-        /^__PACKAGE__->register_method\(\{$/ { in_register = 1 }
-        in_register && /^\}\);$/ { last_register = NR; in_register = 0 }
-
-        # Buffer all lines
-        { lines[NR] = $0 }
-
-        END {
-            use_inserted = 0
-            register_inserted = 0
-            for (i = 1; i <= NR; i++) {
-                print lines[i]
-                if (i == last_use && !use_inserted) {
-                    print "use PVE::API2::Hardware::GPU;"
-                    use_inserted = 1
-                }
-                if (i == last_register && !register_inserted) {
-                    print ""
-                    print "__PACKAGE__->register_method({"
-                    print "    subclass => \"PVE::API2::Hardware::GPU\","
-                    print "    path => '"'"'gpu'"'"',"
-                    print "});"
-                    register_inserted = 1
-                }
-            }
-        }
-    ' "$HARDWARE_PM" > "$tmp"
-
-    # Also add { type => 'gpu' } to the index return array
-    local tmp2
-    tmp2=$(mktemp)
-    sed "s/{ type => 'usb' },/{ type => 'usb' },\n            { type => 'gpu' },/" "$tmp" > "$tmp2"
-
-    mv "$tmp2" "$HARDWARE_PM"
-    chmod 644 "$HARDWARE_PM"
-    rm -f "$tmp"
-    log "Patched $HARDWARE_PM: added GPU subclass registration"
-    APPLIED=1
-}
-
-enable_service() {
-    if command -v systemctl >/dev/null 2>&1; then
-        systemctl daemon-reload || true
-        systemctl enable pve-gpu-sriov.service || log "WARNING: Failed to enable pve-gpu-sriov.service"
-        systemctl start pve-gpu-sriov.service || log "WARNING: Failed to start pve-gpu-sriov.service"
-        log "Enabled and started pve-gpu-sriov.service"
-        systemctl enable pve-gpu-vfio.service || log "WARNING: Failed to enable pve-gpu-vfio.service"
-        log "Enabled pve-gpu-vfio.service"
-    fi
-}
-
-restart_pveproxy() {
-    if command -v systemctl >/dev/null 2>&1; then
-        systemctl restart pveproxy || log "WARNING: Failed to restart pveproxy"
-        systemctl restart pvedaemon || log "WARNING: Failed to restart pvedaemon"
-        log "Restarted pveproxy and pvedaemon"
-    fi
+    systemctl daemon-reload || true
+    systemctl enable pve-gpu-vfio.service \
+        || log "WARNING: Failed to enable pve-gpu-vfio.service"
+    systemctl enable pve-gpu-sriov.service \
+        || log "WARNING: Failed to enable pve-gpu-sriov.service"
+    # Never apply persisted GPU state merely because a package was installed
+    # or upgraded.  The API applies explicit user changes transactionally;
+    # this service restores them only during a later boot, before pve-guests.
 }
 
 case "$1" in
     configure)
-        # Copy default VF templates to /etc/pve/local/ if not already present
-        if [ -f /usr/share/pve-gpu/gpu-vf-templates.conf ] && [ ! -f /etc/pve/local/gpu-vf-templates.conf ]; then
-            cp /usr/share/pve-gpu/gpu-vf-templates.conf /etc/pve/local/gpu-vf-templates.conf 2>/dev/null || \
-                log "WARNING: Could not copy templates to /etc/pve/local/ (pmxcfs may not be mounted)"
+        if [ ! -x "$PATCH_SCRIPT" ]; then
+            log "ERROR: $PATCH_SCRIPT is missing or not executable"
+            exit 1
         fi
-        patch_index_html
-        patch_hardware_pm
-        enable_service
-        if [ "$APPLIED" -eq 1 ]; then
-            restart_pveproxy
-        fi
+        "$PATCH_SCRIPT" --apply
+        enable_services
         ;;
     abort-upgrade|abort-remove|abort-deconfigure)
         ;;

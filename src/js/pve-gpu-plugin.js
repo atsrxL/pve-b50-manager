@@ -89,6 +89,174 @@ Ext.define('PVE.store.GpuDevices', {
 });
 
 /* =========================================================================
+ * GpuVfioDialog — choose the live PF driver and update its boot policy
+ * ========================================================================= */
+
+Ext.define('PVE.window.GpuVfioDialog', {
+    extend: 'Ext.window.Window',
+    alias: 'widget.gpuVfioDialog',
+
+    title: gettext('Select GPU Driver'),
+    width: 560,
+    modal: true,
+    resizable: false,
+    bodyPadding: 12,
+    layout: 'anchor',
+
+    config: {
+        pveSelNode: null,
+        deviceRecord: null
+    },
+
+    initComponent: function() {
+        var me = this;
+        var rec = me.deviceRecord;
+        var deviceName = rec ? (rec.get('device_name') || '-') : '-';
+        var bdf = rec ? (rec.get('bdf') || '-') : '-';
+        var currentDriver = rec ? (rec.get('driver') || '') : '';
+        var targetDriver = currentDriver === 'vfio-pci' ? 'vfio-pci' : 'xe';
+
+        me.currentDriver = currentDriver;
+        me.driverStore = Ext.create('Ext.data.Store', {
+            fields: ['value', 'label'],
+            data: [
+                { value: 'xe', label: gettext('xe (host driver)') },
+                { value: 'vfio-pci', label: gettext('vfio-pci (VM passthrough)') }
+            ]
+        });
+
+        me.items = [
+            {
+                xtype: 'displayfield',
+                fieldLabel: gettext('Device'),
+                labelWidth: 130,
+                value: Ext.htmlEncode(deviceName + ' (' + bdf + ')')
+            },
+            {
+                xtype: 'displayfield',
+                fieldLabel: gettext('Current driver'),
+                labelWidth: 130,
+                value: Ext.htmlEncode(currentDriver || gettext('Unbound'))
+            },
+            {
+                xtype: 'combobox',
+                itemId: 'driverField',
+                name: 'driver',
+                fieldLabel: gettext('Target driver'),
+                labelWidth: 130,
+                anchor: '100%',
+                store: me.driverStore,
+                queryMode: 'local',
+                editable: false,
+                forceSelection: true,
+                valueField: 'value',
+                displayField: 'label',
+                value: targetDriver,
+                listeners: {
+                    change: function() { me.updateState(); }
+                }
+            },
+            {
+                xtype: 'component',
+                itemId: 'warning',
+                margin: '10 0 0 135',
+                padding: 7,
+                hidden: true,
+                style: 'background:#fff3cd;border:1px solid #e0ae38;color:#6b4b00;',
+                html: ''
+            }
+        ];
+
+        me.buttons = [
+            {
+                text: gettext('Cancel'),
+                handler: function() { me.close(); }
+            },
+            {
+                text: gettext('Apply'),
+                itemId: 'applyBtn',
+                iconCls: 'fa fa-check',
+                handler: function() { me.submit(); }
+            }
+        ];
+
+        me.callParent();
+        me.updateState();
+    },
+
+    nodeName: function() {
+        return this.pveSelNode && this.pveSelNode.data ?
+            this.pveSelNode.data.node : undefined;
+    },
+
+    updateState: function() {
+        var me = this;
+        var field = me.down('#driverField');
+        var target = field ? field.getValue() : null;
+        var rec = me.deviceRecord;
+        var activeVfs = rec ? Number(rec.get('sriov_numvfs') || 0) : 0;
+        var blocked = target === 'vfio-pci' && activeVfs > 0;
+        var warning = me.down('#warning');
+
+        if (warning) {
+            if (blocked) {
+                warning.setHtml('<i class="fa fa-ban"></i> ' +
+                    Ext.htmlEncode(gettext('Stop and remove all active VFs before binding the PF to vfio-pci.')));
+                warning.setStyle('background', '#fde2e2');
+                warning.setStyle('border-color', '#d66');
+                warning.setStyle('color', '#7a1d1d');
+                warning.show();
+            } else {
+                warning.hide();
+            }
+        }
+
+        var apply = me.down('#applyBtn');
+        if (apply) {
+            apply.setDisabled(!target || blocked);
+        }
+    },
+
+    submit: function() {
+        var me = this;
+        var field = me.down('#driverField');
+        var target = field ? field.getValue() : null;
+        var bdf = me.deviceRecord ? me.deviceRecord.get('bdf') : null;
+        var nodeName = me.nodeName();
+        if (!nodeName || !bdf || (target !== 'xe' && target !== 'vfio-pci')) {
+            return;
+        }
+
+        me.updateState();
+        var apply = me.down('#applyBtn');
+        if (!apply || apply.disabled) {
+            return;
+        }
+
+        var action = target === 'vfio-pci' ? 'bind' : 'unbind';
+        apply.setDisabled(true);
+        me.setLoading(true);
+        Proxmox.Utils.API2Request({
+            url: '/nodes/' + encodeURIComponent(nodeName) +
+                '/hardware/gpu/' + encodeURIComponent(bdf) + '/vfio',
+            method: 'POST',
+            params: { action: action, persist: 1 },
+            success: function(response) {
+                var data = response.result && response.result.data;
+                me.setLoading(false);
+                me.close();
+                me.fireEvent('vfiochanged', me, bdf, data);
+            },
+            failure: function(response, opts, error) {
+                me.setLoading(false);
+                me.updateState();
+                Ext.Msg.alert(gettext('Error'), error || response.htmlStatus);
+            }
+        });
+    }
+});
+
+/* =========================================================================
  * GpuDeviceGrid — main device list
  * ========================================================================= */
 
@@ -106,6 +274,11 @@ Ext.define('PVE.grid.GpuDeviceGrid', {
 
     store: {
         type: 'gpuDevices'
+    },
+
+    selModel: {
+        mode: 'SINGLE',
+        allowDeselect: false
     },
 
     columns: [
@@ -281,14 +454,20 @@ Ext.define('PVE.grid.GpuDeviceGrid', {
         {
             header: gettext('VFIO'),
             dataIndex: 'vfio_configured',
-            width: 70,
+            width: 90,
             align: 'center',
-            renderer: function(val) {
+            renderer: function(val, meta, record) {
+                meta.tdStyle = 'cursor:pointer;';
+                meta.tdAttr = 'data-qtip="' + Ext.htmlEncode(
+                    gettext('Click to choose the PF driver')
+                ) + '"';
                 if (val) {
                     return '<span style="color:#e84040;font-weight:bold;">' +
-                        '<i class="fa fa-plug"></i> ' + gettext('Bound') + '</span>';
+                        '<i class="fa fa-plug"></i> vfio-pci</span>';
                 }
-                return '';
+                var driver = record.get('driver') || gettext('Unbound');
+                return '<span style="color:#2673b8;text-decoration:underline;">' +
+                    Ext.htmlEncode(driver) + '</span>';
             }
         }
     ],
@@ -301,16 +480,6 @@ Ext.define('PVE.grid.GpuDeviceGrid', {
             handler: function() {
                 this.up('gpuDeviceGrid').reload();
             }
-        },
-        {
-            xtype: 'button',
-            itemId: 'vfioBtn',
-            text: gettext('Bind to VFIO-PCI'),
-            iconCls: 'fa fa-plug',
-            disabled: true,
-            handler: function() {
-                this.up('gpuDeviceGrid').toggleVfio();
-            }
         }
     ],
 
@@ -320,19 +489,16 @@ Ext.define('PVE.grid.GpuDeviceGrid', {
         me.callParent();
 
         me.on('selectionchange', function(selModel, records) {
-            var vfioBtn = me.down('#vfioBtn');
             if (records.length > 0) {
                 var rec = records[0];
                 me.fireEvent('deviceselect', me, rec);
-                if (vfioBtn) {
-                    var isVfio = rec.get('vfio_configured');
-                    var numVfs = rec.get('sriov_numvfs') || 0;
-                    vfioBtn.setText(isVfio ? gettext('Unbind from VFIO-PCI') : gettext('Bind to VFIO-PCI'));
-                    vfioBtn.setIconCls(isVfio ? 'fa fa-eject' : 'fa fa-plug');
-                    vfioBtn.setDisabled(!isVfio && numVfs > 0);
-                }
-            } else if (vfioBtn) {
-                vfioBtn.setDisabled(true);
+            }
+        });
+
+        me.on('cellclick', function(view, td, cellIndex, record, tr, rowIndex, e) {
+            var column = view.getHeaderCt().getHeaderAtIndex(cellIndex);
+            if (column && column.dataIndex === 'vfio_configured') {
+                me.fireEvent('vfioclick', me, record, e);
             }
         });
 
@@ -357,12 +523,15 @@ Ext.define('PVE.grid.GpuDeviceGrid', {
         });
     },
 
-    reload: function() {
+    reload: function(preferredBdf) {
         var me = this;
         var nodeName = me.pveSelNode && me.pveSelNode.data ? me.pveSelNode.data.node : undefined;
         if (!nodeName) {
             return;
         }
+
+        var selected = me.getSelectionModel().getSelection();
+        var selectedBdf = preferredBdf || (selected.length ? selected[0].get('bdf') : null);
 
         Proxmox.Utils.API2Request({
             url: '/nodes/' + encodeURIComponent(nodeName) + '/hardware/gpu',
@@ -370,7 +539,24 @@ Ext.define('PVE.grid.GpuDeviceGrid', {
             success: function(response) {
                 var data = response.result && response.result.data;
                 if (Ext.isArray(data)) {
-                    me.getStore().loadData(data);
+                    var store = me.getStore();
+                    store.loadData(data);
+
+                    // loadData replaces records, so explicitly restore the
+                    // selected BDF.  On first entry (or when it disappeared),
+                    // select the first GPU so the detail panel is populated.
+                    var next = selectedBdf ? store.findRecord('bdf', selectedBdf) : null;
+                    next = next || store.getAt(0);
+                    if (next) {
+                        Ext.defer(function() {
+                            if (me.destroyed || me.isDestroyed) {
+                                return;
+                            }
+                            me.getSelectionModel().select(next);
+                        }, 0);
+                    } else {
+                        me.getSelectionModel().deselectAll();
+                    }
                 }
             },
             failure: function(response, opts, error) {
@@ -382,73 +568,28 @@ Ext.define('PVE.grid.GpuDeviceGrid', {
         });
     },
 
-    toggleVfio: function() {
+    openVfioDialog: function(record) {
         var me = this;
-        var sel = me.getSelectionModel().getSelection();
-        if (!sel.length) return;
-        var rec = sel[0];
+        if (!record) {
+            return;
+        }
 
-        var isVfio = rec.get('vfio_configured');
-        var action = isVfio ? 'unbind' : 'bind';
-        var deviceName = rec.get('device_name');
-        var bdf = rec.get('bdf');
-        var nodeName = me.pveSelNode.data.node;
-
-        Ext.Msg.show({
-            title: isVfio ? gettext('Unbind from VFIO-PCI') : gettext('Bind to VFIO-PCI'),
-            msg: Ext.String.format(
-                gettext('This will {0} {1} ({2}) {3} vfio-pci driver.'),
-                action, deviceName, bdf, isVfio ? gettext('from') : gettext('to')
-            ),
-            buttons: Ext.Msg.OKCANCEL,
-            icon: Ext.Msg.QUESTION,
-            fn: function(btn) {
-                if (btn !== 'ok') return;
-
-                Proxmox.Utils.API2Request({
-                    url: '/nodes/' + encodeURIComponent(nodeName) +
-                         '/hardware/gpu/' + encodeURIComponent(bdf) + '/vfio',
-                    method: 'POST',
-                    params: { action: action, persist: 1 },
-                    success: function(response) {
-                        var data = response.result && response.result.data;
-                        var rebootRequired = data && data.reboot_required;
-
-                        if (rebootRequired) {
-                            Ext.Msg.show({
-                                title: gettext('Reboot Required'),
-                                msg: gettext('Driver binding changed and boot configuration updated.') +
-                                     '<br><br>' +
-                                     gettext('A reboot is required for the change to take full effect.'),
-                                buttons: Ext.Msg.YESNO,
-                                buttonText: {
-                                    yes: gettext('Reboot Now'),
-                                    no: gettext('Later')
-                                },
-                                icon: Ext.Msg.WARNING,
-                                fn: function(rbtn) {
-                                    if (rbtn === 'yes') {
-                                        Proxmox.Utils.API2Request({
-                                            url: '/nodes/' + encodeURIComponent(nodeName) + '/status',
-                                            method: 'POST',
-                                            params: { command: 'reboot' },
-                                            failure: function(resp) {
-                                                Ext.Msg.alert(gettext('Error'), resp.htmlStatus);
-                                            }
-                                        });
-                                    }
-                                }
-                            });
-                        }
-
-                        me.reload();
-                    },
-                    failure: function(response, opts, error) {
-                        Ext.Msg.alert(gettext('Error'), error || response.htmlStatus);
-                    }
-                });
+        var dlg = Ext.create('PVE.window.GpuVfioDialog', {
+            pveSelNode: me.pveSelNode,
+            deviceRecord: record
+        });
+        dlg.on('vfiochanged', function(window, bdf, data) {
+            // Reload using the changed BDF so the live driver, persistence
+            // flag, and detail cards all follow the same selected record.
+            me.reload(bdf);
+            if (data && data.reboot_required) {
+                Ext.Msg.alert(
+                    gettext('Reboot Required'),
+                    gettext('The VFIO boot configuration was updated. A reboot is required for the persistent change to take effect.')
+                );
             }
         });
+        dlg.show();
     }
 });
 
@@ -962,10 +1103,10 @@ Ext.define('PVE.panel.GpuDriftBanner', {
             },
             {
                 xtype: 'button',
-                text: gettext('Re-apply Config'),
-                iconCls: 'fa fa-redo',
+                text: gettext('Review profiles'),
+                iconCls: 'fa fa-sliders',
                 margin: '0 4',
-                handler: function() { me.reapplyConfig(); }
+                handler: function() { me.fireEvent('reviewprofiles', me); }
             },
             {
                 xtype: 'button',
@@ -988,37 +1129,113 @@ Ext.define('PVE.panel.GpuDriftBanner', {
             msgCmp.setText(drift.message || gettext('Persisted SR-IOV configuration does not match running state.'));
         }
         me.show();
-    },
-
-    reapplyConfig: function() {
-        var me = this;
-        var nodeName = me.pveSelNode && me.pveSelNode.data ? me.pveSelNode.data.node : undefined;
-        if (!nodeName || !me.currentBdf) { return; }
-
-        me.setLoading(true);
-        Proxmox.Utils.API2Request({
-            url: '/nodes/' + encodeURIComponent(nodeName) +
-                 '/hardware/gpu/' + encodeURIComponent(me.currentBdf) + '/sriov/apply',
-            method: 'POST',
-            success: function() {
-                me.setLoading(false);
-                me.hide();
-                me.fireEvent('configapplied', me);
-            },
-            failure: function(response, opts, error) {
-                me.setLoading(false);
-                Ext.Msg.alert(gettext('Error'), Ext.String.format(
-                    gettext('Failed to re-apply config: {0}'),
-                    error || response.htmlStatus
-                ));
-            }
-        });
     }
 });
 
 /* =========================================================================
  * GpuVfStore — backs the VF grid
  * ========================================================================= */
+
+var gpuVfResourceSpecs = [
+    {
+        name: 'vram',
+        label: gettext('VRAM'),
+        unit: 'GiB',
+        byteValue: true,
+        defaultStep: 0.125,
+        minValue: 0.125,
+        decimalPrecision: 3
+    },
+    {
+        name: 'ggtt',
+        label: gettext('GGTT'),
+        unit: 'GiB',
+        byteValue: true,
+        defaultStep: 0.125,
+        minValue: 0.125,
+        decimalPrecision: 3
+    },
+    {
+        name: 'contexts',
+        label: gettext('Contexts'),
+        unit: gettext('per GT'),
+        minValue: 1,
+        defaultStep: 1,
+        decimalPrecision: 0
+    },
+    {
+        name: 'doorbells',
+        label: gettext('Doorbells'),
+        unit: gettext('per GT'),
+        minValue: 1,
+        defaultStep: 1,
+        decimalPrecision: 0
+    },
+    {
+        name: 'exec_quantum_ms',
+        label: gettext('Execution quantum'),
+        unit: 'ms',
+        minValue: 0,
+        defaultStep: 1,
+        decimalPrecision: 0
+    },
+    {
+        name: 'preempt_timeout_us',
+        label: gettext('Preemption timeout'),
+        unit: 'µs',
+        minValue: 0,
+        defaultStep: 100,
+        decimalPrecision: 0
+    }
+];
+
+function gpuVfSpec(name) {
+    for (var i = 0; i < gpuVfResourceSpecs.length; i++) {
+        if (gpuVfResourceSpecs[i].name === name) {
+            return gpuVfResourceSpecs[i];
+        }
+    }
+    return null;
+}
+
+function gpuVfDisplayValue(name, value) {
+    if (value === null || value === undefined || value === '' || isNaN(Number(value))) {
+        return gettext('Unavailable');
+    }
+    var spec = gpuVfSpec(name);
+    var numeric = Number(value);
+    if (spec && spec.byteValue) {
+        return gpuFormatBytes(numeric);
+    }
+    return String(numeric) + (spec && spec.unit ? ' ' + spec.unit : '');
+}
+
+function gpuVfResourceRenderer(name) {
+    return function(resources) {
+        var resource = resources && resources[name];
+        if (!resource) {
+            return '<span style="color:#888;">' + gettext('Unavailable') + '</span>';
+        }
+
+        var mode = resource.mode || 'unknown';
+        var modeText = mode === 'auto' ? gettext('Auto') :
+            (mode === 'custom' ? gettext('Custom') : gettext('Unknown'));
+        var modeColour = mode === 'auto' ? '#2673b8' :
+            (mode === 'custom' ? '#7a4ea3' : '#888');
+        var configured = resource.configured;
+        var effective = resource.effective;
+        var liveText = resource.mixed ? gettext('Mixed') : gpuVfDisplayValue(name, effective);
+        var text = '<span style="color:' + modeColour + ';font-weight:bold;">' +
+            Ext.htmlEncode(modeText) + '</span>';
+
+        if (mode === 'custom' && configured !== null && configured !== undefined) {
+            text += ' ' + Ext.htmlEncode(gpuVfDisplayValue(name, configured));
+        }
+        text += '<br><span style="color:#777;font-size:90%;">' + gettext('Live') + ': ' +
+            Ext.htmlEncode(liveText) + '</span>';
+        return text;
+    };
+}
 
 Ext.define('PVE.store.GpuVfs', {
     extend: 'Ext.data.Store',
@@ -1027,11 +1244,11 @@ Ext.define('PVE.store.GpuVfs', {
     fields: [
         { name: 'vf_index', type: 'auto' },
         'bdf',
-        { name: 'lmem_quota', type: 'auto' },
-        { name: 'ggtt_quota', type: 'auto' },
-        { name: 'exec_quantum_ms', type: 'auto' },
-        { name: 'preempt_timeout_us', type: 'auto' },
+        'driver',
+        'hostpci',
+        { name: 'resources', type: 'auto' },
         { name: 'assigned', type: 'auto' },
+        { name: 'running', type: 'auto' },
         { name: 'vmid', type: 'auto' }
     ],
 
@@ -1044,7 +1261,7 @@ Ext.define('PVE.store.GpuVfs', {
 });
 
 /* =========================================================================
- * ModifyVfsDialog — modal window for VF count + per-VF LMEM management
+ * ModifyVfsDialog — SR-IOV v2 per-VF profile editor
  * ========================================================================= */
 
 Ext.define('PVE.window.ModifyVfsDialog', {
@@ -1052,61 +1269,100 @@ Ext.define('PVE.window.ModifyVfsDialog', {
     alias: 'widget.pveModifyVfsDialog',
 
     title: gettext('Modify Virtual Functions'),
-    width: 600,
+    width: 980,
+    height: 720,
     modal: true,
     resizable: true,
+    scrollable: 'y',
     layout: { type: 'vbox', align: 'stretch' },
     bodyPadding: 10,
 
     config: {
         pveSelNode: null,
-        deviceRecord: null
+        deviceRecord: null,
+        sriovStatus: null
     },
 
     initComponent: function() {
         var me = this;
         var rec = me.deviceRecord;
+        var status = me.sriovStatus || {};
+        var caps = status.capabilities || {};
         var deviceName = rec ? rec.get('device_name') : '-';
         var bdf = rec ? rec.get('bdf') : '-';
-        var totalVfs = rec ? (rec.get('sriov_maxvfs') || 0) : 0;
-        var currentNumVfs = rec ? (rec.get('sriov_numvfs') || 0) : 0;
-        var telemetry = rec ? rec.get('telemetry') : null;
-        var lmemTotalMb = telemetry ? (telemetry.lmem_total_mb || 0) : 0;
-        var lmemTotalGib = lmemTotalMb / 1024;
+        var currentNumVfs = Number(status.sriov_numvfs !== undefined ?
+            status.sriov_numvfs : (rec ? rec.get('sriov_numvfs') : 0)) || 0;
+        var totalVfs = Number(caps.effective_max_vfs || status.sriov_maxvfs ||
+            (rec ? rec.get('sriov_maxvfs') : 0)) || 0;
+        var schedulerCaps = caps.scheduler || {};
+        var persisted = status.persisted_config || {};
+        var currentScheduler = status.scheduler_priority || status.sched_priority ||
+            persisted.sched_priority || schedulerCaps.default || 'low';
 
-        me.lmemTotalGib = lmemTotalGib;
+        me.capabilities = caps;
+        me.resourceCapabilities = caps.resources || {};
+        me.schedulerCapabilities = schedulerCaps;
+        me.currentNumVfs = currentNumVfs;
+        me.currentScheduler = currentScheduler;
         me.totalVfs = totalVfs;
-        // vfRows stores { vfIndex, lmemGib, assigned, vmid } for each current VF row
+        me.apiReady = Number(status.api_version) >= 2 && !!caps.per_vf_profiles;
         me.vfRows = [];
+        me.rowCache = {};
+        me.hasAssignedConsumer = false;
+        me.hasRunningConsumer = false;
+        me.forceRequired = false;
+
+        var schedulerStore = Ext.create('Ext.data.Store', {
+            fields: ['value', 'text'],
+            data: [
+                { value: 'low', text: gettext('Low (recommended)') },
+                { value: 'normal', text: gettext('Normal (experimental)') }
+            ]
+        });
+
+        if (currentScheduler !== 'low' && currentScheduler !== 'normal') {
+            currentScheduler = schedulerCaps.default === 'normal' ? 'normal' : 'low';
+        }
 
         me.items = [
             {
-                xtype: 'displayfield',
-                fieldLabel: gettext('Device'),
-                labelWidth: 160,
-                value: Ext.htmlEncode(deviceName + ' (' + bdf + ')')
+                xtype: 'component',
+                itemId: 'apiWarning',
+                hidden: me.apiReady,
+                margin: '0 0 10 0',
+                padding: 8,
+                style: 'background:#fde2e2;border:1px solid #d66;color:#7a1d1d;',
+                html: '<i class="fa fa-ban"></i> ' +
+                    Ext.htmlEncode(gettext('This editor requires the SR-IOV v2 API and per-VF profile capability.'))
             },
             {
-                xtype: 'displayfield',
-                fieldLabel: gettext('Total LMEM'),
-                labelWidth: 160,
-                value: lmemTotalGib > 0 ? lmemTotalGib.toFixed(2) + ' GiB' : gettext('Unknown')
-            },
-            {
-                xtype: 'displayfield',
-                fieldLabel: gettext('Max VFs'),
-                labelWidth: 160,
-                value: String(totalVfs)
+                xtype: 'container',
+                layout: { type: 'hbox', align: 'middle' },
+                defaults: { xtype: 'displayfield', labelWidth: 85, margin: '0 20 0 0' },
+                items: [
+                    {
+                        fieldLabel: gettext('Device'),
+                        flex: 1,
+                        value: Ext.htmlEncode(deviceName + ' (' + bdf + ')')
+                    },
+                    {
+                        fieldLabel: gettext('Max VFs'),
+                        width: 150,
+                        value: String(totalVfs)
+                    }
+                ]
             },
             {
                 xtype: 'numberfield',
                 itemId: 'numVfsField',
                 fieldLabel: gettext('Number of VFs'),
                 labelWidth: 160,
+                width: 330,
                 name: 'num_vfs',
                 value: currentNumVfs,
                 minValue: 0,
                 maxValue: totalVfs,
+                allowDecimals: false,
                 allowBlank: false,
                 listeners: {
                     change: function(field, newVal) {
@@ -1115,10 +1371,71 @@ Ext.define('PVE.window.ModifyVfsDialog', {
                 }
             },
             {
+                xtype: 'component',
+                itemId: 'consumerSummary',
+                margin: '3 0 8 160',
+                html: ''
+            },
+            {
+                xtype: 'combo',
+                itemId: 'schedulerField',
+                fieldLabel: gettext('Scheduler priority'),
+                labelWidth: 160,
+                width: 430,
+                store: schedulerStore,
+                queryMode: 'local',
+                displayField: 'text',
+                valueField: 'value',
+                editable: false,
+                forceSelection: true,
+                value: currentScheduler,
+                disabled: schedulerCaps.supported === false || schedulerCaps.writable === false,
+                listeners: {
+                    change: function(field, value) {
+                        var warning = me.down('#schedulerWarning');
+                        if (warning) {
+                            warning.setVisible(value === 'normal');
+                        }
+                        me.updateOperationState();
+                    }
+                }
+            },
+            {
+                xtype: 'component',
+                itemId: 'schedulerWarning',
+                hidden: currentScheduler !== 'normal',
+                margin: '0 0 8 160',
+                padding: 7,
+                style: 'background:#fff3cd;border:1px solid #e0ae38;color:#6b4b00;',
+                html: '<i class="fa fa-exclamation-triangle"></i> ' +
+                    Ext.htmlEncode(gettext('Normal is experimental on Intel B50. It may cause Windows Code 43, GuC errors, or loss of guest connectivity.'))
+            },
+            {
+                xtype: 'checkbox',
+                itemId: 'forceReprovisionCb',
+                fieldLabel: gettext('Force VF reprovision'),
+                labelWidth: 160,
+                boxLabel: gettext('Destroy and recreate all VF PCI functions'),
+                checked: false,
+                listeners: {
+                    change: function() { me.updateOperationState(); }
+                }
+            },
+            {
+                xtype: 'component',
+                itemId: 'operationWarning',
+                hidden: true,
+                margin: '0 0 10 0',
+                padding: 8,
+                style: 'background:#fff3cd;border:1px solid #e0ae38;color:#6b4b00;',
+                html: ''
+            },
+            {
                 xtype: 'fieldset',
-                title: gettext('Per-VF LMEM Allocation (GiB)'),
-                itemId: 'vfLmemFieldset',
+                title: gettext('Per-VF resource profiles'),
+                itemId: 'vfProfilesFieldset',
                 layout: { type: 'vbox', align: 'stretch' },
+                defaults: { anchor: '100%' },
                 items: []
             },
             {
@@ -1129,6 +1446,12 @@ Ext.define('PVE.window.ModifyVfsDialog', {
                 checked: true,
                 inputValue: 1,
                 uncheckedValue: 0
+            },
+            {
+                xtype: 'component',
+                margin: '0 0 0 160',
+                style: 'color:#777;',
+                html: Ext.htmlEncode(gettext('VF drivers will not be auto-probed; passthrough bindings remain under Proxmox control.'))
             }
         ];
 
@@ -1142,6 +1465,7 @@ Ext.define('PVE.window.ModifyVfsDialog', {
                 text: gettext('Apply'),
                 itemId: 'applyBtn',
                 iconCls: 'fa fa-check',
+                disabled: true,
                 handler: function() { me.doApply(); }
             }
         ];
@@ -1149,293 +1473,819 @@ Ext.define('PVE.window.ModifyVfsDialog', {
         me.callParent();
     },
 
-    /**
-     * Called after show() to load current VF LMEM data from the VF store.
-     * @param {Ext.data.Store} vfStore  The store from the parent vfGrid
-     */
+    resourceCapability: function(name) {
+        return this.resourceCapabilities[name] || {
+            supported: false,
+            writable: false
+        };
+    },
+
+    quotaToInput: function(name, quota) {
+        if (quota === null || quota === undefined || quota === '' || isNaN(Number(quota))) {
+            return null;
+        }
+        var spec = gpuVfSpec(name);
+        return spec && spec.byteValue ? Number(quota) / (1024 * 1024 * 1024) : Number(quota);
+    },
+
+    inputToQuota: function(name, input) {
+        if (input === null || input === undefined || input === '' || isNaN(Number(input))) {
+            return null;
+        }
+        var spec = gpuVfSpec(name);
+        return spec && spec.byteValue ? Math.round(Number(input) * 1024 * 1024 * 1024) : Math.round(Number(input));
+    },
+
+    newResourceState: function(name) {
+        var cap = this.resourceCapability(name);
+        return {
+            name: name,
+            mode: 'auto',
+            initialMode: 'absent',
+            quota: null,
+            initialQuota: null,
+            effective: null,
+            mixed: false,
+            supported: cap.supported !== false,
+            writable: cap.writable !== false,
+            capability: cap
+        };
+    },
+
+    existingResourceState: function(name, source) {
+        var me = this;
+        var cap = me.resourceCapability(name);
+        source = source || {};
+        var sourceMode = source.mode || 'unknown';
+        var effective = source.effective;
+        var configured = source.configured;
+        var mode;
+        var quota;
+
+        if (sourceMode === 'auto') {
+            mode = 'auto';
+            quota = null;
+        } else if (sourceMode === 'custom') {
+            mode = 'custom';
+            quota = configured !== null && configured !== undefined ? configured : effective;
+        } else {
+            // v2 runtime state without provenance is made explicit.  Never
+            // silently treat a live quota as driver-managed Auto.
+            mode = 'custom';
+            quota = effective;
+        }
+
+        return {
+            name: name,
+            mode: mode,
+            initialMode: sourceMode,
+            quota: quota !== null && quota !== undefined ? Number(quota) : null,
+            initialQuota: quota !== null && quota !== undefined ? Number(quota) : null,
+            effective: effective !== null && effective !== undefined ? Number(effective) : null,
+            mixed: !!source.mixed,
+            supported: cap.supported !== false,
+            writable: cap.writable !== false && source.writable !== false,
+            capability: cap
+        };
+    },
+
+    newVfRow: function(index) {
+        var me = this;
+        var resources = {};
+        gpuVfResourceSpecs.forEach(function(spec) {
+            resources[spec.name] = me.newResourceState(spec.name);
+        });
+        return {
+            vfIndex: index,
+            bdf: '',
+            assigned: false,
+            running: false,
+            vmid: null,
+            hostpci: null,
+            resources: resources
+        };
+    },
+
     loadVfData: function(vfStore) {
         var me = this;
-        var rec = me.deviceRecord;
-        var currentNumVfs = rec ? (rec.get('sriov_numvfs') || 0) : 0;
-
-        // Calculate minimum VF count: highest assigned VF index
-        var minVfs = 0;
-        if (vfStore) {
-            vfStore.each(function(vfRec) {
-                if (vfRec.get('assigned')) {
-                    var idx = vfRec.get('vf_index');
-                    if (idx > minVfs) { minVfs = idx; }
-                }
-            });
-        }
-        // minVfs is the highest assigned index; we need at least that many VFs
-        // (vf_index is 1-based typically, so minVfs == count needed)
-        me.down('#numVfsField').setMinValue(minVfs);
-
-        // Build vfRows from store
-        me.vfRows = [];
-        if (vfStore && currentNumVfs > 0) {
-            for (var i = 1; i <= currentNumVfs; i++) {
-                var vfRec = vfStore.findRecord('vf_index', i);
-                var lmemBytes = vfRec ? Number(vfRec.get('lmem_quota')) : 0;
-                var lmemGib = lmemBytes > 0 ? lmemBytes / (1024 * 1024 * 1024) : 0;
-                var assigned = vfRec ? !!vfRec.get('assigned') : false;
-                var vmid = vfRec ? vfRec.get('vmid') : null;
-                me.vfRows.push({
-                    vfIndex: i,
-                    lmemGib: lmemGib,
-                    assigned: assigned,
-                    vmid: vmid
-                });
+        var assignments = (me.sriovStatus && me.sriovStatus.assignments) || [];
+        var assignmentsByVf = {};
+        assignments.forEach(function(assignment) {
+            if (Number(assignment.vf_index) > 0) {
+                assignmentsByVf[Number(assignment.vf_index)] = assignment;
             }
+        });
+        me.vfRows = [];
+        me.rowCache = {};
+        me.hasAssignedConsumer = assignments.length > 0;
+        me.hasRunningConsumer = assignments.some(function(assignment) {
+            return !!assignment.running;
+        });
+
+        for (var i = 1; i <= me.currentNumVfs; i++) {
+            var vfRec = vfStore ? vfStore.findRecord('vf_index', i) : null;
+            var resources = vfRec ? vfRec.get('resources') : null;
+            var assignment = assignmentsByVf[i];
+            var row = {
+                vfIndex: i,
+                bdf: vfRec ? (vfRec.get('bdf') || '') : '',
+                assigned: assignment ? true : (vfRec ? !!vfRec.get('assigned') : false),
+                running: assignment ? !!assignment.running : (vfRec ? !!vfRec.get('running') : false),
+                vmid: assignment ? assignment.vmid : (vfRec ? vfRec.get('vmid') : null),
+                hostpci: assignment ? assignment.key : (vfRec ? vfRec.get('hostpci') : null),
+                resources: {}
+            };
+
+            gpuVfResourceSpecs.forEach(function(spec) {
+                row.resources[spec.name] = me.existingResourceState(
+                    spec.name,
+                    resources && resources[spec.name]
+                );
+            });
+
+            me.hasAssignedConsumer = me.hasAssignedConsumer || row.assigned;
+            me.hasRunningConsumer = me.hasRunningConsumer || row.running;
+            me.vfRows.push(row);
+            me.rowCache[i] = row;
         }
 
+        // Keep the v2 server's explicit blockers authoritative even if a
+        // consumer disappears from an individual VF record during a refresh.
+        var blocked = (me.sriovStatus && me.sriovStatus.change_blocked) || {};
+        me.hasAssignedConsumer = me.hasAssignedConsumer || !!blocked.topology;
+        me.hasRunningConsumer = me.hasRunningConsumer || !!blocked.resources;
+
+        me.updateConsumerSummary();
         me.rebuildVfRows();
+        me.updateOperationState();
     },
 
-    /**
-     * Called when the VF count spinner changes.
-     */
+    updateConsumerSummary: function() {
+        var me = this;
+        var parts = [];
+        for (var i = 1; i <= me.currentNumVfs; i++) {
+            var row = me.rowCache[i];
+            if (!row || !row.assigned) { continue; }
+            var text = gettext('VF') + row.vfIndex + ' → VM ' + (row.vmid || '?');
+            text += row.running ? ' (' + gettext('running') + ')' : ' (' + gettext('stopped') + ')';
+            parts.push(Ext.htmlEncode(text));
+        }
+        var summary = me.down('#consumerSummary');
+        if (summary) {
+            summary.setHtml(parts.length ?
+                '<span style="color:' + (me.hasRunningConsumer ? '#b52b27' : '#666') + ';">' +
+                parts.join(', ') + '</span>' :
+                '<span style="color:#777;">' + Ext.htmlEncode(gettext('No VM consumers')) + '</span>');
+        }
+    },
+
     onVfCountChange: function(newCount) {
         var me = this;
-        newCount = parseInt(newCount, 10) || 0;
-        // Enforce upper bound
-        if (newCount > me.totalVfs) {
-            newCount = me.totalVfs;
+        newCount = parseInt(newCount, 10);
+        if (isNaN(newCount)) {
+            me.updateOperationState();
+            return;
+        }
+        newCount = Math.max(0, Math.min(newCount, me.totalVfs));
+
+        if (newCount !== Number(me.down('#numVfsField').getValue())) {
             me.down('#numVfsField').setValue(newCount);
             return;
         }
-        // Enforce lower bound: cannot go below highest assigned VF index
-        var minVfs = 0;
-        me.vfRows.forEach(function(r) {
-            if (r.assigned && r.vfIndex > minVfs) { minVfs = r.vfIndex; }
-        });
-        if (newCount < minVfs) {
-            newCount = minVfs;
-            me.down('#numVfsField').setValue(newCount);
-            return;
-        }
-        if (newCount < 0) {
-            newCount = 0;
-            me.down('#numVfsField').setValue(0);
-            return;
-        }
-        var oldCount = me.vfRows.length;
 
-        if (newCount > oldCount) {
-            // Add new VF rows (placeholder, will be redistributed below)
-            for (var i = oldCount + 1; i <= newCount; i++) {
-                me.vfRows.push({
-                    vfIndex: i,
-                    lmemGib: 0,
-                    assigned: false,
-                    vmid: null
-                });
+        var rows = [];
+        for (var i = 1; i <= newCount; i++) {
+            var row = me.rowCache[i];
+            if (!row) {
+                row = me.newVfRow(i);
+                me.rowCache[i] = row;
             }
-        } else if (newCount < oldCount) {
-            // Remove trailing VFs
-            me.vfRows = me.vfRows.slice(0, newCount);
+            rows.push(row);
         }
-
-        // Redistribute all available LMEM evenly among unassigned VFs
-        var assignedLmem = 0;
-        var unassignedCount = 0;
-        me.vfRows.forEach(function(r) {
-            if (r.assigned) {
-                assignedLmem += r.lmemGib;
-            } else {
-                unassignedCount++;
-            }
-        });
-        var availableLmem = me.lmemTotalGib - assignedLmem;
-        var shareEach = unassignedCount > 0 ? availableLmem / unassignedCount : 0;
-        shareEach = Math.max(Math.floor(shareEach * 100) / 100, 0.125);
-        me.vfRows.forEach(function(r) {
-            if (!r.assigned) {
-                r.lmemGib = shareEach;
-            }
-        });
-
+        me.vfRows = rows;
         me.rebuildVfRows();
+        me.updateOperationState();
     },
 
-    /**
-     * Rebuild the per-VF LMEM number fields in the fieldset.
-     */
+    resourceInputConfig: function(row, resource, spec) {
+        var me = this;
+        var cap = resource.capability || {};
+        var alignment = Number(cap.alignment_bytes || 0);
+        var step = spec.byteValue && alignment > 0 ?
+            alignment / (1024 * 1024 * 1024) : spec.defaultStep;
+        var inputValue = me.quotaToInput(spec.name, resource.quota);
+        var custom = resource.mode === 'custom';
+        var editable = resource.supported && resource.writable;
+
+        var modeStore = Ext.create('Ext.data.Store', {
+            fields: ['value', 'text'],
+            data: [
+                { value: 'auto', text: gettext('Auto') },
+                { value: 'custom', text: gettext('Custom') }
+            ]
+        });
+
+        var valueField;
+        var modeField = Ext.create('Ext.form.field.ComboBox', {
+            width: 110,
+            margin: '0 8 0 0',
+            store: modeStore,
+            queryMode: 'local',
+            displayField: 'text',
+            valueField: 'value',
+            editable: false,
+            forceSelection: true,
+            value: resource.mode,
+            disabled: !editable,
+            listeners: {
+                change: function(field, value) {
+                    resource.mode = value;
+                    if (value === 'custom' && (resource.quota === null || resource.quota === undefined)) {
+                        resource.quota = resource.effective !== null && resource.effective !== undefined ?
+                            resource.effective : me.inputToQuota(spec.name, spec.minValue);
+                    }
+                    if (valueField) {
+                        valueField.setValue(me.quotaToInput(spec.name, resource.quota));
+                        valueField.setDisabled(value !== 'custom' || !editable);
+                    }
+                    me.updateOperationState();
+                }
+            }
+        });
+
+        valueField = Ext.create('Ext.form.field.Number', {
+            width: 145,
+            margin: '0 8 0 0',
+            value: inputValue,
+            minValue: spec.minValue,
+            maxValue: 9007199254740991,
+            step: step,
+            decimalPrecision: spec.decimalPrecision,
+            allowDecimals: spec.decimalPrecision > 0,
+            allowBlank: !custom,
+            disabled: !custom || !editable,
+            emptyText: gettext('Driver managed'),
+            listeners: {
+                change: function(field, value) {
+                    if (resource.mode === 'custom') {
+                        resource.quota = me.inputToQuota(spec.name, value);
+                    }
+                    me.updateOperationState();
+                }
+            }
+        });
+
+        var liveText = resource.mixed ? gettext('Mixed values across GTs') :
+            gpuVfDisplayValue(spec.name, resource.effective);
+        if (!resource.supported) {
+            liveText = gettext('Unsupported by this device/driver');
+        } else if (!resource.writable) {
+            liveText += ' (' + gettext('read-only') + ')';
+        }
+
+        return {
+            xtype: 'container',
+            layout: { type: 'hbox', align: 'middle' },
+            margin: '2 0',
+            items: [
+                {
+                    xtype: 'label',
+                    text: spec.label,
+                    width: 170
+                },
+                modeField,
+                valueField,
+                {
+                    xtype: 'label',
+                    text: spec.unit,
+                    width: 70
+                },
+                {
+                    xtype: 'component',
+                    flex: 1,
+                    html: '<span style="color:#777;">' + gettext('Live') + ': ' +
+                        Ext.htmlEncode(liveText) + '</span>'
+                }
+            ]
+        };
+    },
+
     rebuildVfRows: function() {
         var me = this;
-        var fieldset = me.down('#vfLmemFieldset');
+        var fieldset = me.down('#vfProfilesFieldset');
         if (!fieldset) { return; }
-
         fieldset.removeAll(true);
 
-        me.vfRows.forEach(function(row, idx) {
-            var label = gettext('VF') + ' ' + row.vfIndex;
-            if (row.assigned && row.vmid) {
-                label += ' <span style="color:#26a826;">[VM ' + Ext.htmlEncode(String(row.vmid)) + ']</span>';
-            } else if (row.assigned) {
-                label += ' <span style="color:#26a826;">[' + gettext('Assigned') + ']</span>';
+        fieldset.add({
+            xtype: 'component',
+            margin: '0 0 8 0',
+            padding: 7,
+            style: 'background:#eef6ff;border:1px solid #9fc2e8;color:#254d73;',
+            html: '<strong>' + Ext.htmlEncode(gettext('Auto')) + ':</strong> ' +
+                Ext.htmlEncode(gettext('the xe driver assigns the live value during VF provisioning; Auto never means a zero quota.')) +
+                ' <strong>' + Ext.htmlEncode(gettext('Custom')) + ':</strong> ' +
+                Ext.htmlEncode(gettext('write the exact value shown in this profile.')) + ' ' +
+                Ext.htmlEncode(gettext('Existing values with unknown provenance are imported as Custom from their live effective value.'))
+        });
+
+        me.vfRows.forEach(function(row) {
+            var title = gettext('VF') + ' ' + row.vfIndex;
+            if (row.bdf) {
+                title += ' — ' + row.bdf;
+            }
+            if (row.assigned) {
+                title += ' — VM ' + (row.vmid || '?') +
+                    (row.running ? ' (' + gettext('running') + ')' : ' (' + gettext('stopped') + ')');
+            } else if (row.vfIndex > me.currentNumVfs) {
+                title += ' — ' + gettext('new; driver-managed Auto defaults');
             }
 
+            var resourceItems = [];
+            gpuVfResourceSpecs.forEach(function(spec) {
+                resourceItems.push(me.resourceInputConfig(row, row.resources[spec.name], spec));
+            });
+
             fieldset.add({
-                xtype: 'container',
-                layout: { type: 'hbox', align: 'middle' },
-                margin: '2 0',
-                items: [
-                    {
-                        xtype: 'label',
-                        html: label,
-                        width: 160,
-                        style: row.assigned ? 'font-weight:bold;' : ''
-                    },
-                    {
-                        xtype: 'numberfield',
-                        itemId: 'vfLmem_' + row.vfIndex,
-                        flex: 1,
-                        value: row.lmemGib,
-                        minValue: 0.125,
-                        maxValue: me.lmemTotalGib,
-                        decimalPrecision: 2,
-                        step: 0.5,
-                        disabled: row.assigned,
-                        listeners: {
-                            change: (function(vfIdx) {
-                                return function(field, newVal) {
-                                    var val = parseFloat(newVal) || 0;
-                                    // Check if total would exceed max
-                                    var otherSum = 0;
-                                    me.vfRows.forEach(function(r) {
-                                        if (r.vfIndex !== vfIdx) { otherSum += r.lmemGib; }
-                                    });
-                                    var maxForThis = Math.floor((me.lmemTotalGib - otherSum) * 100) / 100;
-                                    if (val > maxForThis) {
-                                        val = maxForThis;
-                                        field.setValue(val);
-                                    }
-                                    me.vfRows[vfIdx - 1].lmemGib = val;
-                                    me.updateLmemSummary();
-                                };
-                            }(row.vfIndex))
-                        }
-                    },
-                    {
-                        xtype: 'label',
-                        text: 'GiB',
-                        margin: '0 0 0 6'
-                    }
-                ]
+                xtype: 'fieldset',
+                title: Ext.htmlEncode(title),
+                collapsible: true,
+                collapsed: row.vfIndex > 1,
+                margin: '3 0 8 0',
+                layout: { type: 'vbox', align: 'stretch' },
+                items: resourceItems
             });
         });
 
         if (me.vfRows.length === 0) {
             fieldset.add({
-                xtype: 'label',
-                text: gettext('No VFs configured. Set the VF count above to allocate.'),
-                style: 'color:#888;font-style:italic;'
+                xtype: 'component',
+                padding: 8,
+                style: 'color:#888;font-style:italic;',
+                html: Ext.htmlEncode(gettext('No VFs will remain. Applying this operation removes every VF PCI function.'))
             });
         }
-
-        // Add LMEM usage summary
-        fieldset.add({
-            xtype: 'label',
-            itemId: 'lmemSummary',
-            margin: '8 0 0 0',
-            style: 'font-weight:bold;'
-        });
-        me.updateLmemSummary();
     },
 
-    updateLmemSummary: function() {
+    resourceValidationError: function() {
         var me = this;
-        var totalUsed = 0;
-        me.vfRows.forEach(function(r) { totalUsed += r.lmemGib; });
-        var remaining = me.lmemTotalGib - totalUsed;
-        var label = me.down('#lmemSummary');
-        if (label) {
-            var colour = remaining < 0 ? '#e84040' : '#26a826';
-            label.setHtml(
-                gettext('Total allocated') + ': ' +
-                '<span style="color:' + colour + ';">' +
-                totalUsed.toFixed(2) + ' / ' + me.lmemTotalGib.toFixed(2) + ' GiB' +
-                '</span>' +
-                ' (' + remaining.toFixed(2) + ' GiB ' + gettext('remaining') + ')'
-            );
+        for (var i = 0; i < me.vfRows.length; i++) {
+            var row = me.vfRows[i];
+            for (var j = 0; j < gpuVfResourceSpecs.length; j++) {
+                var spec = gpuVfResourceSpecs[j];
+                var resource = row.resources[spec.name];
+                if (resource.mode === 'auto') {
+                    if (me.capabilities.auto_provisioning === false) {
+                        return Ext.String.format(
+                            gettext('VF{0} {1} cannot use Auto because driver auto-provisioning is unavailable.'),
+                            row.vfIndex, spec.label);
+                    }
+                    continue;
+                }
+                if (!resource.supported || !resource.writable) {
+                    return Ext.String.format(
+                        gettext('VF{0} {1} is not writable on this device.'),
+                        row.vfIndex, spec.label);
+                }
+                var quota = Number(resource.quota);
+                var minimum = me.inputToQuota(spec.name, spec.minValue);
+                if (!isFinite(quota) || Math.floor(quota) !== quota || quota < minimum) {
+                    return Ext.String.format(
+                        gettext('VF{0} has an invalid custom value for {1}.'),
+                        row.vfIndex, spec.label);
+                }
+                var alignment = Number(resource.capability.alignment_bytes || 0);
+                if (alignment > 0 && quota % alignment !== 0) {
+                    return Ext.String.format(
+                        gettext('VF{0} {1} must be aligned to {2}.'),
+                        row.vfIndex, spec.label, gpuFormatBytes(alignment));
+                }
+            }
+        }
+        return null;
+    },
+
+    autoTransitionRequiresReprovision: function() {
+        for (var i = 0; i < this.vfRows.length; i++) {
+            var resources = this.vfRows[i].resources;
+            for (var j = 0; j < gpuVfResourceSpecs.length; j++) {
+                var resource = resources[gpuVfResourceSpecs[j].name];
+                if (resource.mode === 'auto' &&
+                    resource.initialMode !== 'auto' &&
+                    resource.initialMode !== 'absent') {
+                    return true;
+                }
+            }
+        }
+        return false;
+    },
+
+    updateOperationState: function() {
+        var me = this;
+        if (!me.rendered) { return; }
+        var countField = me.down('#numVfsField');
+        var targetCount = countField ? parseInt(countField.getValue(), 10) : me.currentNumVfs;
+        targetCount = isNaN(targetCount) ? 0 : targetCount;
+        var topologyChanged = targetCount !== me.currentNumVfs;
+        var autoTransition = me.autoTransitionRequiresReprovision();
+        var required = topologyChanged || autoTransition;
+        var forceField = me.down('#forceReprovisionCb');
+
+        if (forceField) {
+            if (required) {
+                if (!forceField.getValue()) {
+                    forceField.suspendEvents(false);
+                    forceField.setValue(true);
+                    forceField.resumeEvents();
+                }
+                forceField.setDisabled(true);
+            } else {
+                if (me.forceRequired && forceField.getValue()) {
+                    forceField.suspendEvents(false);
+                    forceField.setValue(false);
+                    forceField.resumeEvents();
+                }
+                forceField.setDisabled(false);
+            }
+        }
+        me.forceRequired = required;
+        var forceActive = forceField ? !!forceField.getValue() : required;
+        var scheduler = me.down('#schedulerField');
+        var schedulerValue = scheduler && !scheduler.disabled ? scheduler.getValue() : 'unchanged';
+        var validationError = me.resourceValidationError();
+        var blockers = [];
+        var notices = [];
+
+        if (!me.apiReady) {
+            blockers.push(gettext('SR-IOV v2 per-VF profiles are unavailable.'));
+        }
+        if (me.hasRunningConsumer) {
+            blockers.push(gettext('A consumer VM is running. Stop it before changing resources.'));
+        }
+        if (topologyChanged) {
+            notices.push(gettext('Changing the VF count destroys and recreates every VF PCI function.'));
+            if (me.hasAssignedConsumer) {
+                blockers.push(gettext('Detach all assigned VFs before changing the VF count.'));
+            }
+        }
+        if (autoTransition) {
+            notices.push(gettext('Switching an existing resource to Auto requires a full VF reprovision.'));
+        }
+        if (forceActive && !topologyChanged && !autoTransition) {
+            notices.push(gettext('Forced reprovision destroys and recreates every VF PCI function.'));
+        }
+        if (forceActive && me.hasAssignedConsumer) {
+            blockers.push(gettext('Detach all assigned VFs before forcing reprovision.'));
+        }
+        if (schedulerValue === 'normal' && me.hasAssignedConsumer) {
+            blockers.push(gettext('The experimental Normal scheduler cannot be enabled while a VF is assigned.'));
+        }
+        if (validationError) {
+            blockers.push(validationError);
+        }
+
+        var warning = me.down('#operationWarning');
+        if (warning) {
+            var lines = notices.concat(blockers);
+            warning.setVisible(lines.length > 0);
+            warning.setHtml(lines.length ?
+                '<i class="fa fa-exclamation-triangle"></i> ' +
+                lines.map(function(line) { return Ext.htmlEncode(line); }).join('<br>') : '');
+            warning.setStyle('background', blockers.length ? '#fde2e2' : '#fff3cd');
+            warning.setStyle('border-color', blockers.length ? '#d66' : '#e0ae38');
+            warning.setStyle('color', blockers.length ? '#7a1d1d' : '#6b4b00');
+        }
+
+        var apply = me.down('#applyBtn');
+        if (apply) {
+            apply.setDisabled(blockers.length > 0 || !countField || !countField.isValid());
+            apply.setText(targetCount === 0 ? gettext('Remove all VFs') : gettext('Apply'));
+            apply.setIconCls(targetCount === 0 ? 'fa fa-trash' : 'fa fa-check');
         }
     },
 
-    doApply: function() {
+    buildProfiles: function() {
+        return this.vfRows.map(function(row) {
+            var resources = {};
+            gpuVfResourceSpecs.forEach(function(spec) {
+                var state = row.resources[spec.name];
+                resources[spec.name] = { mode: state.mode };
+                if (state.mode === 'custom') {
+                    resources[spec.name].quota = Number(state.quota);
+                }
+            });
+            return {
+                vf_index: row.vfIndex,
+                resources: resources
+            };
+        });
+    },
+
+    submitProfiles: function(params) {
         var me = this;
         var nodeName = me.pveSelNode && me.pveSelNode.data ? me.pveSelNode.data.node : undefined;
         var bdf = me.deviceRecord ? me.deviceRecord.get('bdf') : null;
         if (!nodeName || !bdf) { return; }
 
-        var numVfsField = me.down('#numVfsField');
-        var newNumVfs = parseInt(numVfsField.getValue(), 10) || 0;
-        var currentNumVfs = me.deviceRecord ? (me.deviceRecord.get('sriov_numvfs') || 0) : 0;
-
-        // Final validation: enforce bounds
-        var totalLmem = 0;
-        me.vfRows.forEach(function(r) { totalLmem += r.lmemGib; });
-        if (totalLmem > me.lmemTotalGib) {
-            Ext.Msg.alert(gettext('Error'), Ext.String.format(
-                gettext('Total LMEM allocation ({0} GiB) exceeds available ({1} GiB)'),
-                totalLmem.toFixed(2), me.lmemTotalGib.toFixed(2)));
-            return;
-        }
-        if (newNumVfs > me.totalVfs) {
-            Ext.Msg.alert(gettext('Error'), Ext.String.format(
-                gettext('Cannot exceed maximum VF count ({0})'), me.totalVfs));
-            return;
-        }
-        var minVfs = 0;
-        me.vfRows.forEach(function(r) {
-            if (r.assigned && r.vfIndex > minVfs) { minVfs = r.vfIndex; }
-        });
-        if (newNumVfs < minVfs) {
-            Ext.Msg.alert(gettext('Error'), Ext.String.format(
-                gettext('Cannot reduce below {0} VFs — VF{0} is assigned to a VM'), minVfs));
-            return;
-        }
-        var persist = me.down('#persistCb').getValue() ? 1 : 0;
-
-        // Compute lmem_per_vf (backend uses a single value for all VFs)
-        // Use the average of per-VF allocations, converted from GiB to bytes
-        var lmemParams = {};
-        if (newNumVfs > 0 && me.vfRows.length > 0) {
-            var totalLmemGib = 0;
-            me.vfRows.forEach(function(row) { totalLmemGib += row.lmemGib; });
-            var avgLmemBytes = Math.round((totalLmemGib / newNumVfs) * 1024 * 1024 * 1024);
-            lmemParams.lmem_per_vf = avgLmemBytes;
-        }
-
         me.setLoading(true);
+        Proxmox.Utils.API2Request({
+            url: '/nodes/' + encodeURIComponent(nodeName) +
+                 '/hardware/gpu/' + encodeURIComponent(bdf) + '/sriov',
+            method: 'POST',
+            params: params,
+            success: function() {
+                me.setLoading(false);
+                me.close();
+                me.fireEvent('vfsmodified', me);
+            },
+            failure: function(response, opts, error) {
+                me.setLoading(false);
+                Ext.Msg.alert(gettext('Error'), Ext.String.format(
+                    gettext('Failed to apply VF configuration: {0}'),
+                    error || response.htmlStatus
+                ));
+            }
+        });
+    },
 
-        var baseUrl = '/nodes/' + encodeURIComponent(nodeName) +
-                      '/hardware/gpu/' + encodeURIComponent(bdf) + '/sriov';
+    doApply: function() {
+        var me = this;
+        me.updateOperationState();
+        var apply = me.down('#applyBtn');
+        if (!apply || apply.disabled) { return; }
 
-        var doPost = function() {
-            var postParams = Ext.apply({ num_vfs: newNumVfs, persist: persist }, lmemParams);
-            Proxmox.Utils.API2Request({
-                url: baseUrl,
-                method: 'POST',
-                params: postParams,
-                success: function() {
-                    me.setLoading(false);
-                    me.close();
-                    me.fireEvent('vfsmodified', me);
-                },
-                failure: function(response, opts, error) {
-                    me.setLoading(false);
-                    Ext.Msg.alert(gettext('Error'), Ext.String.format(
-                        gettext('Failed to create VFs: {0}'),
-                        error || response.htmlStatus
-                    ));
-                }
-            });
+        var targetCount = parseInt(me.down('#numVfsField').getValue(), 10) || 0;
+        var schedulerField = me.down('#schedulerField');
+        var scheduler = schedulerField && !schedulerField.disabled ?
+            schedulerField.getValue() : 'unchanged';
+        var forceReprovision = !!me.down('#forceReprovisionCb').getValue();
+        var params = {
+            num_vfs: targetCount,
+            vf_profiles: Ext.encode(targetCount > 0 ? me.buildProfiles() : []),
+            sched_priority: scheduler,
+            allow_unsafe_scheduler: scheduler === 'normal' ? 1 : 0,
+            force_reprovision: forceReprovision ? 1 : 0,
+            persist: me.down('#persistCb').getValue() ? 1 : 0,
+            drivers_autoprobe: 0
         };
 
-        // POST handles all cases: create, modify, and remove (num_vfs=0)
-        doPost();
+        var submit = function() { me.submitProfiles(params); };
+        var confirmScheduler = function() {
+            if (scheduler !== 'normal' || targetCount === 0) {
+                submit();
+                return;
+            }
+            Ext.Msg.confirm(
+                gettext('Enable experimental scheduler?'),
+                gettext('Normal scheduling has caused Windows Code 43, GuC errors, and guest connectivity loss on Intel B50. Continue only with a tested rollback path.'),
+                function(answer) {
+                    if (answer === 'yes') { submit(); }
+                }
+            );
+        };
+
+        if (targetCount === 0) {
+            Ext.Msg.confirm(
+                gettext('Remove all VFs?'),
+                gettext('All VF PCI functions will disappear and the persisted SR-IOV profile will be removed.'),
+                function(answer) {
+                    if (answer === 'yes') { confirmScheduler(); }
+                }
+            );
+        } else {
+            confirmScheduler();
+        }
+    }
+});
+
+/* =========================================================================
+ * AssignVfDialog — stopped-VM VF assignment editor
+ * ========================================================================= */
+
+Ext.define('PVE.window.AssignVfDialog', {
+    extend: 'Ext.window.Window',
+    alias: 'widget.pveAssignVfDialog',
+
+    title: gettext('Assign Virtual Function'),
+    width: 560,
+    modal: true,
+    resizable: false,
+    bodyPadding: 12,
+    layout: 'anchor',
+
+    config: {
+        pveSelNode: null,
+        deviceRecord: null,
+        vfRecord: null
+    },
+
+    initComponent: function() {
+        var me = this;
+        var vf = me.vfRecord;
+        var currentVmid = Number(vf.get('vmid')) || 0;
+
+        me.currentVmid = currentVmid;
+        me.vmStore = Ext.create('Ext.data.Store', {
+            fields: [
+                { name: 'vmid', type: 'int' },
+                'name',
+                'status',
+                'label'
+            ],
+            data: [{
+                vmid: 0,
+                name: '',
+                status: 'none',
+                label: '\u2014 ' + gettext('None (unassigned)')
+            }],
+            sorters: [{ property: 'vmid', direction: 'ASC' }]
+        });
+
+        me.items = [
+            {
+                xtype: 'displayfield',
+                fieldLabel: gettext('Virtual Function'),
+                labelWidth: 130,
+                value: 'VF ' + Ext.htmlEncode(String(vf.get('vf_index'))) +
+                    ' (' + Ext.htmlEncode(vf.get('bdf') || '-') + ')'
+            },
+            {
+                xtype: 'displayfield',
+                fieldLabel: gettext('Current VM'),
+                labelWidth: 130,
+                value: currentVmid ? Ext.htmlEncode(String(currentVmid)) : gettext('None')
+            },
+            {
+                xtype: 'combobox',
+                itemId: 'vmField',
+                fieldLabel: gettext('Assign to'),
+                labelWidth: 130,
+                anchor: '100%',
+                store: me.vmStore,
+                queryMode: 'local',
+                editable: false,
+                forceSelection: true,
+                valueField: 'vmid',
+                displayField: 'label',
+                value: currentVmid,
+                listConfig: {
+                    getInnerTpl: function() {
+                        return '{[Ext.htmlEncode(values.label)]}';
+                    }
+                },
+                listeners: {
+                    change: function(field, value) {
+                        var apply = me.down('#applyAssignmentBtn');
+                        if (apply) {
+                            apply.setDisabled(Number(value) === me.currentVmid);
+                        }
+                    }
+                }
+            },
+            {
+                xtype: 'component',
+                margin: '10 0 0 135',
+                style: 'color:#666;',
+                html: Ext.htmlEncode(gettext('Only stopped, unlocked QEMU VMs are listed. The VM must be stopped before assigning or removing a VF.'))
+            }
+        ];
+
+        me.buttons = [
+            {
+                text: gettext('Cancel'),
+                handler: function() { me.close(); }
+            },
+            {
+                text: gettext('Apply'),
+                itemId: 'applyAssignmentBtn',
+                iconCls: 'fa fa-check',
+                disabled: true,
+                handler: function() { me.confirmAndSubmit(); }
+            }
+        ];
+
+        me.callParent();
+        me.on('afterrender', function() { me.loadVms(); }, me, { single: true });
+    },
+
+    nodeName: function() {
+        return this.pveSelNode && this.pveSelNode.data ?
+            this.pveSelNode.data.node : undefined;
+    },
+
+    loadVms: function() {
+        var me = this;
+        var nodeName = me.nodeName();
+        if (!nodeName) { return; }
+        me.setLoading(true);
+        Proxmox.Utils.API2Request({
+            url: '/nodes/' + encodeURIComponent(nodeName) + '/qemu',
+            method: 'GET',
+            success: function(response) {
+                var data = response.result && response.result.data;
+                var rows = [{
+                    vmid: 0,
+                    name: '',
+                    status: 'none',
+                    label: '\u2014 ' + gettext('None (unassigned)')
+                }];
+                Ext.Array.each(Ext.isArray(data) ? data : [], function(vm) {
+                    var vmid = Number(vm.vmid) || 0;
+                    if (!vmid || vm.template || vm.status !== 'stopped' || vm.lock) {
+                        return;
+                    }
+                    var name = vm.name ? String(vm.name) : gettext('unnamed');
+                    rows.push({
+                        vmid: vmid,
+                        name: name,
+                        status: vm.status,
+                        label: vmid + ' (' + name + ') \u2014 ' + gettext('stopped')
+                    });
+                });
+                me.vmStore.loadData(rows);
+                var field = me.down('#vmField');
+                if (field) {
+                    if (!me.vmStore.findRecord('vmid', me.currentVmid) && me.currentVmid) {
+                        me.vmStore.add({
+                            vmid: me.currentVmid,
+                            name: '',
+                            status: 'stopped',
+                            label: me.currentVmid + ' \u2014 ' + gettext('current VM')
+                        });
+                    }
+                    field.setValue(me.currentVmid);
+                }
+                me.setLoading(false);
+            },
+            failure: function(response, opts, error) {
+                me.setLoading(false);
+                Ext.Msg.alert(gettext('Error'), Ext.String.format(
+                    gettext('Failed to load QEMU VMs: {0}'),
+                    error || response.htmlStatus
+                ));
+            }
+        });
+    },
+
+    confirmAndSubmit: function() {
+        var me = this;
+        var targetVmid = Number(me.down('#vmField').getValue()) || 0;
+        if (targetVmid === me.currentVmid) { return; }
+
+        var vfLabel = 'VF ' + me.vfRecord.get('vf_index') +
+            ' (' + (me.vfRecord.get('bdf') || '-') + ')';
+        var message;
+        if (!targetVmid) {
+            message = Ext.String.format(
+                gettext('Remove {0} from VM {1} and leave it unassigned?'),
+                Ext.htmlEncode(vfLabel),
+                Ext.htmlEncode(String(me.currentVmid))
+            );
+        } else if (me.currentVmid) {
+            message = Ext.String.format(
+                gettext('Move {0} from VM {1} to VM {2}?'),
+                Ext.htmlEncode(vfLabel),
+                Ext.htmlEncode(String(me.currentVmid)),
+                Ext.htmlEncode(String(targetVmid))
+            );
+        } else {
+            message = Ext.String.format(
+                gettext('Assign {0} to VM {1}?'),
+                Ext.htmlEncode(vfLabel),
+                Ext.htmlEncode(String(targetVmid))
+            );
+        }
+
+        Ext.Msg.confirm(gettext('Confirm VF assignment'), message, function(answer) {
+            if (answer === 'yes') {
+                me.submitAssignment(targetVmid);
+            }
+        });
+    },
+
+    submitAssignment: function(targetVmid) {
+        var me = this;
+        var nodeName = me.nodeName();
+        var pfBdf = me.deviceRecord && me.deviceRecord.get('bdf');
+        if (!nodeName || !pfBdf) { return; }
+
+        me.setLoading(true);
+        Proxmox.Utils.API2Request({
+            url: '/nodes/' + encodeURIComponent(nodeName) +
+                '/hardware/gpu/' + encodeURIComponent(pfBdf) +
+                '/vf/' + encodeURIComponent(me.vfRecord.get('vf_index')) +
+                '/assignment',
+            method: 'PUT',
+            params: { vmid: targetVmid },
+            success: function() {
+                me.setLoading(false);
+                me.fireEvent('assignmentchanged', me);
+                me.close();
+            },
+            failure: function(response, opts, error) {
+                me.setLoading(false);
+                Ext.Msg.alert(gettext('Error'), error || response.htmlStatus);
+            }
+        });
     }
 });
 
@@ -1458,12 +2308,25 @@ Ext.define('PVE.panel.GpuSriovPanel', {
     initComponent: function() {
         var me = this;
 
+        me.sriovStatus = null;
+        me.vfDataLoaded = false;
+
         me.items = [
             // Drift banner
             {
                 xtype: 'gpuDriftBanner',
                 itemId: 'driftBanner',
-                pveSelNode: me.pveSelNode
+                pveSelNode: me.pveSelNode,
+                listeners: {
+                    reviewprofiles: function() { me.openModifyDialog(); }
+                }
+            },
+            {
+                xtype: 'component',
+                itemId: 'schedulerStatus',
+                padding: '6 8',
+                style: 'border-bottom:1px solid #ddd;color:#666;',
+                html: Ext.htmlEncode(gettext('Scheduler: loading...'))
             },
             // VF grid
             {
@@ -1480,33 +2343,62 @@ Ext.define('PVE.panel.GpuSriovPanel', {
                         }
                     },
                     {
-                        header: gettext('LMEM'), dataIndex: 'lmem_quota', width: 120,
-                        renderer: function(val) {
-                            var n = Number(val);
-                            return (n > 0) ? gpuFormatBytes(n) : '-';
-                        }
+                        header: gettext('VRAM'), dataIndex: 'resources', width: 155,
+                        renderer: gpuVfResourceRenderer('vram')
                     },
                     {
-                        header: gettext('Page Size'), dataIndex: 'ggtt_quota', width: 120,
-                        renderer: function(val) {
-                            var n = Number(val);
-                            return (n > 0) ? gpuFormatBytes(n) : '-';
-                        }
+                        header: gettext('GGTT'), dataIndex: 'resources', width: 155,
+                        renderer: gpuVfResourceRenderer('ggtt')
+                    },
+                    {
+                        header: gettext('Contexts'), dataIndex: 'resources', width: 135,
+                        renderer: gpuVfResourceRenderer('contexts')
+                    },
+                    {
+                        header: gettext('Doorbells'), dataIndex: 'resources', width: 135,
+                        renderer: gpuVfResourceRenderer('doorbells')
+                    },
+                    {
+                        header: gettext('Exec quantum'), dataIndex: 'resources', width: 135,
+                        renderer: gpuVfResourceRenderer('exec_quantum_ms')
+                    },
+                    {
+                        header: gettext('Preempt timeout'), dataIndex: 'resources', width: 145,
+                        renderer: gpuVfResourceRenderer('preempt_timeout_us')
                     },
                     {
                         header: gettext('Status'), dataIndex: 'assigned', width: 100,
                         renderer: function(val, meta, record) {
                             if (val) {
-                                return '<span style="color:#26a826;">' + gettext('Assigned') + '</span>';
+                                if (record.get('running')) {
+                                    return '<span style="color:#b52b27;font-weight:bold;">' +
+                                        gettext('VM running') + '</span>';
+                                }
+                                return '<span style="color:#b06b00;">' + gettext('Assigned') + '</span>';
                             }
                             return '<span style="color:#888;">' + gettext('Available') + '</span>';
                         }
                     },
                     {
                         header: gettext('VM'), dataIndex: 'vmid', width: 80,
-                        renderer: function(val) { return val ? String(val) : '\u2014'; }
+                        renderer: function(val, meta) {
+                            meta.tdStyle = 'cursor:pointer;';
+                            meta.tdAttr = 'data-qtip="' + Ext.htmlEncode(
+                                gettext('Double-click to assign this VF to a VM or leave it unassigned')
+                            ) + '"';
+                            return '<span style="color:#2673b8;text-decoration:underline;">' +
+                                Ext.htmlEncode(val ? String(val) : gettext('None')) + '</span>';
+                        }
                     }
                 ],
+                listeners: {
+                    celldblclick: function(view, td, cellIndex, record) {
+                        var column = view.getHeaderCt().getHeaderAtIndex(cellIndex);
+                        if (column && column.dataIndex === 'vmid') {
+                            me.openVfAssignmentDialog(record);
+                        }
+                    }
+                },
                 tbar: [
                     {
                         xtype: 'button',
@@ -1530,6 +2422,8 @@ Ext.define('PVE.panel.GpuSriovPanel', {
     loadDevice: function(deviceRecord) {
         var me = this;
         me.deviceRecord = deviceRecord;
+        me.sriovStatus = null;
+        me.vfDataLoaded = false;
 
         var maxVfs = deviceRecord ? (deviceRecord.get('sriov_maxvfs') || 0) : 0;
         var driver = deviceRecord ? (deviceRecord.get('driver') || '') : '';
@@ -1570,27 +2464,56 @@ Ext.define('PVE.panel.GpuSriovPanel', {
             success: function(response) {
                 var data = response.result && response.result.data;
                 if (!data) { return; }
+                me.sriovStatus = data;
+
+                // The v2 status response includes the same live VF records as
+                // the list endpoint.  Load them immediately so the editor and
+                // capability snapshot are from one coherent read.
+                if (Ext.isArray(data.vfs)) {
+                    var vfStore = me.down('#vfGrid').getStore();
+                    vfStore.removeAll();
+                    vfStore.loadData(data.vfs);
+                    me.vfDataLoaded = true;
+                }
 
                 // Drift banner
                 var driftBanner = me.down('#driftBanner');
                 if (driftBanner) {
                     driftBanner.pveSelNode = me.pveSelNode;
                     driftBanner.currentBdf = bdf;
-                    driftBanner.showDrift(data.drift);
+                    var drift = data.drift || {};
+                    var driftMessage = drift.message;
+                    if (!driftMessage && Ext.isArray(drift.issues) && drift.issues.length) {
+                        driftMessage = drift.issues.join('; ');
+                    }
+                    driftBanner.showDrift({
+                        detected: !!(drift.has_drift || data.config_drift),
+                        message: driftMessage || gettext('Persisted SR-IOV configuration does not match the live VF count, scheduler, or resource profiles.')
+                    });
                 }
 
-                // Enable Modify VFs button only when no VFs are assigned to VMs
-                var modifyBtn = me.down('#modifyVfsBtn');
-                if (modifyBtn) {
-                    var assignedVms = me.deviceRecord ? me.deviceRecord.get('assigned_vms') : [];
-                    var hasAssignedVfs = assignedVms && assignedVms.length > 0;
-                    modifyBtn.setDisabled(hasAssignedVfs);
-                    if (hasAssignedVfs) {
-                        modifyBtn.setTooltip(gettext('Cannot modify VFs while VMs are assigned. Stop and detach VMs first.'));
+                var schedulerStatus = me.down('#schedulerStatus');
+                if (schedulerStatus) {
+                    var priority = data.scheduler_priority || gettext('Unavailable');
+                    var colour = priority === 'low' ? '#2673b8' : '#b06b00';
+                    var suffix;
+                    if (priority === 'normal') {
+                        suffix = ' — ' + gettext('experimental on Intel B50');
+                    } else if (priority === 'low') {
+                        suffix = ' — ' + gettext('recommended');
+                    } else if (priority === 'mixed') {
+                        suffix = ' — ' + gettext('inconsistent across VFs');
                     } else {
-                        modifyBtn.setTooltip('');
+                        suffix = '';
                     }
+                    schedulerStatus.setHtml(
+                        '<strong>' + Ext.htmlEncode(gettext('Device scheduler')) + ':</strong> ' +
+                        '<span style="color:' + colour + ';font-weight:bold;">' +
+                        Ext.htmlEncode(String(priority)) + '</span>' + Ext.htmlEncode(suffix)
+                    );
                 }
+
+                me.updateModifyButton();
             },
             failure: function(response, opts, error) {
                 Ext.Msg.alert(gettext('Error'), Ext.String.format(
@@ -1618,19 +2541,60 @@ Ext.define('PVE.panel.GpuSriovPanel', {
                 if (Ext.isArray(data) && data.length > 0) {
                     store.loadData(data);
                 }
+                me.vfDataLoaded = true;
+                me.updateModifyButton();
             },
             failure: function() {
                 var store = me.down('#vfGrid').getStore();
                 store.removeAll();
+                me.vfDataLoaded = false;
+                me.updateModifyButton();
             }
         });
     },
 
+    updateModifyButton: function() {
+        var me = this;
+        var button = me.down('#modifyVfsBtn');
+        if (!button) { return; }
+        var status = me.sriovStatus;
+        var caps = status && status.capabilities;
+        var apiReady = status && Number(status.api_version) >= 2 &&
+            caps && !!caps.per_vf_profiles;
+        var pfAssigned = me.deviceRecord && me.deviceRecord.get('pf_assigned');
+
+        if (pfAssigned) {
+            button.setDisabled(true);
+            button.setTooltip(gettext('The physical GPU is assigned to a VM.'));
+        } else if (!apiReady) {
+            button.setDisabled(true);
+            button.setTooltip(gettext('SR-IOV v2 per-VF profiles are required; no legacy fallback is available.'));
+        } else if (!me.vfDataLoaded) {
+            button.setDisabled(true);
+            button.setTooltip(gettext('Waiting for live VF resource data.'));
+        } else {
+            button.setDisabled(false);
+            var blocked = status.change_blocked || {};
+            button.setTooltip(blocked.resources ?
+                gettext('A consumer VM is running. You may inspect profiles, but Apply remains disabled until it is stopped.') : '');
+        }
+    },
+
     openModifyDialog: function() {
         var me = this;
+        var caps = me.sriovStatus && me.sriovStatus.capabilities;
+        if (!me.sriovStatus || Number(me.sriovStatus.api_version) < 2 ||
+            !caps || !caps.per_vf_profiles) {
+            Ext.Msg.alert(
+                gettext('Unsupported API'),
+                gettext('SR-IOV v2 per-VF profiles are required. This UI will not submit a legacy uniform-quota request.')
+            );
+            return;
+        }
         var dlg = Ext.create('PVE.window.ModifyVfsDialog', {
             pveSelNode: me.pveSelNode,
-            deviceRecord: me.deviceRecord
+            deviceRecord: me.deviceRecord,
+            sriovStatus: me.sriovStatus
         });
         dlg.on('vfsmodified', function() {
             // Delay reload to let sysfs settle after VF count change
@@ -1644,6 +2608,51 @@ Ext.define('PVE.panel.GpuSriovPanel', {
         // Load current VF data from the grid store
         var vfStore = me.down('#vfGrid').getStore();
         dlg.loadVfData(vfStore);
+    },
+
+    openVfAssignmentDialog: function(vfRecord) {
+        var me = this;
+        var status = me.sriovStatus;
+        var caps = status && status.capabilities;
+        if (!status || Number(status.api_version) < 3 ||
+            !caps || !caps.vf_vm_assignment) {
+            Ext.Msg.alert(
+                gettext('Unsupported API'),
+                gettext('The installed backend does not support safe VF-to-VM assignment.')
+            );
+            return;
+        }
+        if (me.deviceRecord && me.deviceRecord.get('pf_assigned')) {
+            Ext.Msg.alert(
+                gettext('Unavailable'),
+                gettext('The physical GPU is assigned to a VM.')
+            );
+            return;
+        }
+        if (vfRecord.get('running')) {
+            Ext.Msg.alert(
+                gettext('Stop VM first'),
+                Ext.String.format(
+                    gettext('Stop VM {0} before changing this VF assignment.'),
+                    Ext.htmlEncode(String(vfRecord.get('vmid') || '?'))
+                )
+            );
+            return;
+        }
+
+        var dlg = Ext.create('PVE.window.AssignVfDialog', {
+            pveSelNode: me.pveSelNode,
+            deviceRecord: me.deviceRecord,
+            vfRecord: vfRecord
+        });
+        dlg.on('assignmentchanged', function() {
+            Ext.defer(function() {
+                me.reloadVfs();
+                me.reloadSriov();
+                me.fireEvent('vfschanged', me);
+            }, 500);
+        });
+        dlg.show();
     }
 });
 
@@ -1757,6 +2766,9 @@ Ext.define('PVE.node.GpuManager', {
                 listeners: {
                     deviceselect: function(grid, record) {
                         me.down('#deviceDetail').loadDevice(record);
+                    },
+                    vfioclick: function(grid, record) {
+                        grid.openVfioDialog(record);
                     }
                 }
             },

@@ -4,6 +4,7 @@ use strict;
 use warnings;
 use File::Glob ':bsd_glob';
 use PVE::Tools qw(run_command);
+use PVE::GPU::SRIOV qw(active_sched_priority);
 
 # ---------------------------------------------------------------------------
 # Device family map
@@ -35,8 +36,8 @@ my $DEVICE_NAMES = {
     '0x0bda' => 'Intel Data Center GPU Max 1450',
     '0x0bdb' => 'Intel Data Center GPU Max 1350',
     '0x0b6e' => 'Intel Data Center GPU Max (PVC-XT)',
-    '0xe211' => 'Intel Battlemage GPU G21',
-    '0xe212' => 'Intel Battlemage GPU G21',
+    '0xe211' => 'Intel Arc Pro B60 (Battlemage G21)',
+    '0xe212' => 'Intel Arc Pro B50 (Battlemage G21)',
     '0xe222' => 'Intel Battlemage GPU G21',
     '0xe223' => 'Intel Battlemage GPU G21 (12VF)',
 };
@@ -246,7 +247,9 @@ sub read_telemetry {
             close($fh);
 
             # Subtract PF lmem_spare (reserved for PF, not provisionable to VFs)
-            my $spare_path = PVE::API2::Hardware::GPU::sysfs_path("/sys/kernel/debug/dri/$bdf/gt0/pf/lmem_spare");
+            my $spare_path = PVE::API2::Hardware::GPU::sysfs_path(
+                "/sys/kernel/debug/dri/$bdf/sriov/pf/tile0/vram_spare"
+            );
             if (open(my $sfh, '<', $spare_path)) {
                 my $spare = <$sfh>;
                 close($sfh);
@@ -332,30 +335,182 @@ sub read_telemetry {
 }
 
 # ---------------------------------------------------------------------------
-# Plugin interface: get_vf_paths
+# Discover GT indices without assuming that one tile means one GT.  Current
+# Battlemage exposes VRAM/GGTT at tile scope and contexts/doorbells/scheduling
+# below both gt0 and gt1.
 # ---------------------------------------------------------------------------
-sub get_vf_paths {
+sub enumerate_gts {
+    my ($class, $family, $card, $bdf, $vf_index, $tile) = @_;
+    return [0] if $family ne 'bmg' && $family ne 'bmg_12vf';
+
+    my @roots = (
+        "/sys/kernel/debug/dri/$bdf/sriov/vf$vf_index/tile$tile",
+        "/sys/kernel/debug/dri/$bdf/sriov/pf/tile$tile",
+    );
+    my %indices;
+    for my $root (@roots) {
+        my $full = PVE::API2::Hardware::GPU::sysfs_path($root);
+        for my $path (bsd_glob("$full/gt*")) {
+            $indices{$1} = 1 if $path =~ m{/gt(\d+)$} && -d $path;
+        }
+    }
+
+    # G21 B50/B60 currently has two GTs.  The fallback is used only before
+    # the first VF is enabled, when vfN directories may not exist yet.
+    return [0, 1] if !%indices;
+    return [sort { $a <=> $b } keys %indices];
+}
+
+# ---------------------------------------------------------------------------
+# Plugin interface: get_vf_resource_paths
+# Values are arrays because GT-scoped resources have one file per GT.
+# ---------------------------------------------------------------------------
+sub get_vf_resource_paths {
     my ($class, $family, $card, $bdf, $vf_index, $tile) = @_;
 
     if ($family eq 'bmg' || $family eq 'bmg_12vf') {
-        # BMG uses debugfs
-        my $base = "/sys/kernel/debug/dri/$bdf/gt$tile/vf$vf_index";
+        my $base = "/sys/kernel/debug/dri/$bdf/sriov/vf$vf_index/tile$tile";
+        my $gts = $class->enumerate_gts($family, $card, $bdf, $vf_index, $tile);
         return {
-            lmem_quota       => "$base/lmem_quota",
-            ggtt_quota       => "$base/ggtt_quota",
-            exec_quantum_ms  => "$base/exec_quantum_ms",
-            preempt_timeout_us => "$base/preempt_timeout_us",
+            vram               => ["$base/vram_quota"],
+            ggtt               => ["$base/ggtt_quota"],
+            contexts           => [map { "$base/gt$_/contexts_quota" } @$gts],
+            doorbells          => [map { "$base/gt$_/doorbells_quota" } @$gts],
+            exec_quantum_ms    => [map { "$base/gt$_/exec_quantum_ms" } @$gts],
+            preempt_timeout_us => [map { "$base/gt$_/preempt_timeout_us" } @$gts],
+            debug_priority     => [map { "$base/gt$_/sched_priority" } @$gts],
         };
     } else {
-        # Flex / PVC / PVC-XT use sysfs iov paths
         my $base = "/sys/class/drm/$card/iov/vf$vf_index/gt$tile";
         return {
-            lmem_quota         => "$base/lmem_quota",
-            ggtt_quota         => "$base/ggtt_quota",
-            exec_quantum_ms    => "$base/exec_quantum_ms",
-            preempt_timeout_us => "$base/preempt_timeout_us",
+            vram               => ["$base/lmem_quota"],
+            ggtt               => ["$base/ggtt_quota"],
+            contexts           => ["$base/contexts_quota"],
+            doorbells          => ["$base/doorbells_quota"],
+            exec_quantum_ms    => ["$base/exec_quantum_ms"],
+            preempt_timeout_us => ["$base/preempt_timeout_us"],
         };
     }
+}
+
+# Legacy scalar-path adapter retained for callers outside this package.
+sub get_vf_paths {
+    my ($class, @args) = @_;
+    my $paths = $class->get_vf_resource_paths(@args);
+    return {
+        lmem_quota         => $paths->{vram}[0],
+        ggtt_quota         => $paths->{ggtt}[0],
+        exec_quantum_ms    => $paths->{exec_quantum_ms}[0],
+        preempt_timeout_us => $paths->{preempt_timeout_us}[0],
+    };
+}
+
+sub read_pf_available {
+    my ($class, $family, $card, $bdf, $tile) = @_;
+
+    if ($family eq 'bmg' || $family eq 'bmg_12vf') {
+        my $base = "/sys/kernel/debug/dri/$bdf/sriov/pf/tile$tile";
+        my $gts = $class->enumerate_gts($family, $card, $bdf, 1, $tile);
+        my (@contexts, @doorbells);
+        for my $gt (@$gts) {
+            push @contexts, int(PVE::API2::Hardware::GPU::read_sysfs(
+                "$base/gt$gt/contexts_spare"
+            ) // 0);
+            push @doorbells, int(PVE::API2::Hardware::GPU::read_sysfs(
+                "$base/gt$gt/doorbells_spare"
+            ) // 0);
+        }
+        return {
+            vram_spare      => int(PVE::API2::Hardware::GPU::read_sysfs("$base/vram_spare") // 0),
+            ggtt_spare      => int(PVE::API2::Hardware::GPU::read_sysfs("$base/ggtt_spare") // 0),
+            contexts_spare  => \@contexts,
+            doorbells_spare => \@doorbells,
+            gt_count        => scalar(@$gts),
+        };
+    }
+
+    my $base = "/sys/class/drm/$card/iov/pf/gt$tile/available";
+    return {
+        vram_spare      => int(PVE::API2::Hardware::GPU::read_sysfs("$base/lmem_free") // 0),
+        ggtt_spare      => int(PVE::API2::Hardware::GPU::read_sysfs("$base/ggtt_free") // 0),
+        contexts_spare  => [int(PVE::API2::Hardware::GPU::read_sysfs("$base/contexts_free") // 0)],
+        doorbells_spare => [int(PVE::API2::Hardware::GPU::read_sysfs("$base/doorbells_free") // 0)],
+        gt_count        => 1,
+    };
+}
+
+sub prepare_auto_provisioning {
+    my ($class, $family, $bdf) = @_;
+    return 1 if $family ne 'bmg' && $family ne 'bmg_12vf';
+
+    my $path = "/sys/kernel/debug/dri/$bdf/sriov/restore_auto_provisioning";
+    PVE::API2::Hardware::GPU::write_sysfs($path, 1);
+    return 1;
+}
+
+sub read_scheduler_priority {
+    my ($class, $bdf, $vf_index) = @_;
+    $vf_index //= 1;
+    my $raw = PVE::API2::Hardware::GPU::read_sysfs(
+        "/sys/bus/pci/devices/$bdf/sriov_admin/vf$vf_index/profile/sched_priority"
+    );
+    return active_sched_priority($raw);
+}
+
+sub set_scheduler_priority {
+    my ($class, $bdf, $priority) = @_;
+    my $path = "/sys/bus/pci/devices/$bdf/sriov_admin/.bulk_profile/sched_priority";
+    PVE::API2::Hardware::GPU::write_sysfs($path, $priority);
+    return 1;
+}
+
+sub get_sriov_capabilities {
+    my ($class, $family, $card, $bdf, $num_vfs) = @_;
+    my $is_bmg = ($family eq 'bmg' || $family eq 'bmg_12vf');
+    my $auto_path = PVE::API2::Hardware::GPU::sysfs_path(
+        "/sys/kernel/debug/dri/$bdf/sriov/restore_auto_provisioning"
+    );
+    my $sched_path = PVE::API2::Hardware::GPU::sysfs_path(
+        "/sys/bus/pci/devices/$bdf/sriov_admin/.bulk_profile/sched_priority"
+    );
+
+    return {
+        per_vf_profiles            => \1,
+        auto_provisioning          => ($is_bmg && -e $auto_path) ? \1 : \0,
+        count_change_requires_reset => \1,
+        resources => {
+            vram => {
+                supported => \1, writable => \1, scope => 'vf_tile', unit => 'bytes',
+                alignment_bytes => 128 * 1024 * 1024,
+            },
+            ggtt => {
+                supported => \1, writable => \1, scope => 'vf_tile', unit => 'bytes',
+                alignment_bytes => 128 * 1024 * 1024,
+            },
+            contexts => {
+                supported => \1, writable => \1, scope => 'vf_gt', unit => 'count',
+            },
+            doorbells => {
+                supported => \1, writable => \1, scope => 'vf_gt', unit => 'count',
+            },
+            exec_quantum_ms => {
+                supported => \1, writable => \1, scope => 'vf_gt', unit => 'milliseconds',
+            },
+            preempt_timeout_us => {
+                supported => \1, writable => \1, scope => 'vf_gt', unit => 'microseconds',
+            },
+        },
+        scheduler => {
+            supported        => -e $sched_path ? \1 : \0,
+            writable         => -w $sched_path ? \1 : \0,
+            scope            => 'device_bulk',
+            values           => ['low', 'normal'],
+            default          => 'low',
+            recommended      => 'low',
+            dangerous_values => ['normal'],
+            live_change_safe => \0,
+        },
+    };
 }
 
 # ---------------------------------------------------------------------------

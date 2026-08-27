@@ -1,7 +1,8 @@
 [Unit]
-Description=Bind selected Intel GPUs to VFIO-PCI
-Before=display-manager.service
-Before=multi-user.target
+Description=Bind explicitly selected PCI functions to VFIO-PCI
+After=systemd-modules-load.service
+Before=pve-gpu-sriov.service pve-guests.service
+ConditionPathExists=/etc/pve-gpu-vfio.conf
 
 [Service]
 Type=oneshot

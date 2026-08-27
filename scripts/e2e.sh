@@ -455,12 +455,12 @@ if [ -f "$PLAYWRIGHT_DIR/package.json" ]; then
 
     # Run Playwright tests against the VM's forwarded web UI
     info "Running Playwright tests against https://localhost:${WEB_PORT}..."
+    PW_RESULT=0
     (cd "$PLAYWRIGHT_DIR" && \
         PVE_PASSWORD="$PVE_PASSWORD" \
-        npx playwright test --reporter=list 2>&1) || true
+        npx playwright test --reporter=list 2>&1) || PW_RESULT=$?
 
-    # Count Playwright results
-    PW_RESULT=$?
+    # Count Playwright results without masking a failed test command.
     if [ "$PW_RESULT" -eq 0 ]; then
         info "Playwright tests: ALL PASSED"
     else

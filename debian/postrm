@@ -1,31 +1,38 @@
 #!/bin/sh
-# postrm: purge config and backup files
+# Purge configuration created outside dpkg's normal file list.
+
 set -e
 
-INDEX_TPL="/usr/share/pve-manager/index.html.tpl"
-NODES_PM="/usr/share/perl5/PVE/API2/Nodes.pm"
-
 log() {
-    logger -t pve-gpu-postrm "$@" || true
+    logger -t pve-gpu-postrm "$@" 2>/dev/null || true
     echo "pve-gpu-postrm: $*"
 }
 
 case "$1" in
     purge)
-        # Remove config files
+        legacy_blacklist=0
+        if [ -f /etc/modprobe.d/pve-gpu-vfio.conf ]; then
+            legacy_blacklist=1
+        fi
         rm -f /etc/pve/local/gpu-sriov.conf
         rm -f /etc/pve/local/gpu-vf-templates.conf
-        log "Removed config files from /etc/pve/local/"
+        rm -f /etc/modprobe.d/pve-gpu-vfio.conf
+        rm -f /etc/modules-load.d/pve-gpu-vfio.conf
+        rm -f /etc/pve-gpu-vfio.conf
+        rm -f /etc/pve-gpu-sysfs-root
 
-        # Remove backup files
-        for f in "${INDEX_TPL}.pre-gpu" "${NODES_PM}.pre-gpu"; do
-            if [ -f "$f" ]; then
-                rm -f "$f"
-                log "Removed backup $f"
-            fi
-        done
+        # Old package versions created these whole-file backups. They are never
+        # restored because doing so could downgrade files owned by Proxmox.
+        rm -f /usr/share/pve-manager/index.html.tpl.pre-gpu
+        rm -f /usr/share/perl5/PVE/API2/Hardware.pm.pre-gpu
+        rm -f /usr/share/perl5/PVE/API2/Nodes.pm.pre-gpu
 
-        # Reload systemd to drop unit file
+        if [ "$legacy_blacklist" = 1 ] && command -v update-initramfs >/dev/null 2>&1; then
+            update-initramfs -u \
+                || log "WARNING: Failed to remove the legacy GPU blacklist from initramfs"
+        fi
+
+        log "Purged PVE GPU Manager configuration and stale package backups"
         if command -v systemctl >/dev/null 2>&1; then
             systemctl daemon-reload || true
         fi

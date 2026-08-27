@@ -1,3 +1,30 @@
+pve-gpu-manager (1.1.0-3) stable; urgency=medium
+
+  * Add transactional VF assignment, movement, and removal for stopped QEMU VMs
+  * Bind assigned VFs with driver_override so autoprobe-disabled VFs work in PVE
+  * Add guarded live PF switching between xe and vfio-pci with rollback
+  * Auto-select the first GPU and add clickable VFIO and VF assignment cells
+
+ -- PVE GPU Manager <pve-gpu@localhost>  Fri, 28 Aug 2026 02:15:00 +0800
+
+pve-gpu-manager (1.1.0-2) stable; urgency=medium
+
+  * Safely untaint validated sysfs paths before writes under pvedaemon
+  * Add a perl -T regression test for real and fake sysfs path boundaries
+
+ -- PVE GPU Manager <pve-gpu@localhost>  Thu, 27 Aug 2026 23:30:00 +0800
+
+pve-gpu-manager (1.1.0-1) stable; urgency=medium
+
+  * Add Arc Pro B50 and B60 support for the current xe SR-IOV debugfs ABI
+  * Add explicit per-VF auto/custom resource profiles and live readback
+  * Add transactional topology changes, consumer guards, and rollback
+  * Add safe low scheduler default with gated experimental normal mode
+  * Restore verified VF profiles and drivers before PVE guests start
+  * Make PVE integration patches idempotent and upgrade-safe
+
+ -- PVE GPU Manager <pve-gpu@localhost>  Thu, 27 Aug 2026 00:00:00 +0800
+
 pve-gpu-manager (1.0.0-1) stable; urgency=medium
 
   * Initial release

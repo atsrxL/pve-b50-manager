@@ -7,7 +7,7 @@ Standards-Version: 4.5.1
 
 Package: pve-gpu-manager
 Architecture: all
-Depends: pve-manager (>= 8.0), perl, libpve-common-perl, pciutils, linux-perf, ${misc:Depends}
+Depends: pve-manager (>= 8.0), libpve-common-perl, pciutils, linux-perf, ${misc:Depends}, ${perl:Depends}
 Suggests: nvidia-smi
 Description: GPU Manager for Proxmox VE
  Provides discovery, monitoring, and SR-IOV virtual function management

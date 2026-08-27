@@ -1,15 +1,15 @@
 [Unit]
-Description=Apply Intel GPU SR-IOV Configuration
-After=systemd-modules-load.service
-After=dev-dri-card0.device
-After=pve-gpu-vfio.service
-Wants=dev-dri-card0.device
-DefaultDependencies=no
+Description=Restore persisted Intel GPU SR-IOV configuration
+Requires=pve-cluster.service
+Wants=systemd-modules-load.service sys-kernel-debug.mount
+After=systemd-modules-load.service sys-kernel-debug.mount pve-cluster.service pve-gpu-vfio.service
+Before=pve-guests.service
 
 [Service]
 Type=oneshot
 ExecStart=/usr/lib/pve-gpu/apply-sriov-config.sh
 RemainAfterExit=yes
+TimeoutStartSec=180
 StandardOutput=journal
 StandardError=journal
 

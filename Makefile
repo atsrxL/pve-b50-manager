@@ -7,23 +7,30 @@ build:
 	@echo "Nothing to build (pure Perl/JS plugin)"
 
 install:
-	# Perl module
-	install -D -m 0644 src/PVE/API2/Hardware/XPU.pm \
-		$(DESTDIR)/usr/share/perl5/PVE/API2/Hardware/XPU.pm
+	# Perl modules
+	install -D -m 0644 src/PVE/API2/Hardware/GPU.pm \
+		$(DESTDIR)$(PREFIX)/share/perl5/PVE/API2/Hardware/GPU.pm
+	install -D -m 0644 src/PVE/API2/Hardware/GPU/Intel.pm \
+		$(DESTDIR)$(PREFIX)/share/perl5/PVE/API2/Hardware/GPU/Intel.pm
+	install -D -m 0644 src/PVE/API2/Hardware/GPU/Nvidia.pm \
+		$(DESTDIR)$(PREFIX)/share/perl5/PVE/API2/Hardware/GPU/Nvidia.pm
+	install -D -m 0644 src/PVE/GPU/SRIOV.pm \
+		$(DESTDIR)$(PREFIX)/share/perl5/PVE/GPU/SRIOV.pm
 	# JavaScript plugin
 	install -D -m 0644 src/js/pve-gpu-plugin.js \
-		$(DESTDIR)/usr/share/pve-manager/js/pve-gpu-plugin.js
+		$(DESTDIR)$(PREFIX)/share/pve-manager/js/pve-gpu-plugin.js
 	# Scripts
 	install -D -m 0755 src/scripts/apply-sriov-config.sh \
-		$(DESTDIR)/usr/lib/pve-gpu/apply-sriov-config.sh
+		$(DESTDIR)$(PREFIX)/lib/pve-gpu/apply-sriov-config.sh
+	install -D -m 0755 src/scripts/apply-vfio-config.sh \
+		$(DESTDIR)$(PREFIX)/lib/pve-gpu/apply-vfio-config.sh
 	install -D -m 0755 src/scripts/reapply-patches.sh \
-		$(DESTDIR)/usr/lib/pve-gpu/reapply-patches.sh
-	# Systemd service
+		$(DESTDIR)$(PREFIX)/lib/pve-gpu/reapply-patches.sh
+	# Systemd services
 	install -D -m 0644 src/systemd/pve-gpu-sriov.service \
 		$(DESTDIR)/lib/systemd/system/pve-gpu-sriov.service
-	# Default templates (staged; postinst copies to /etc/pve/local/)
-	install -D -m 0644 config/gpu-vf-templates.conf \
-		$(DESTDIR)/usr/share/pve-gpu/gpu-vf-templates.conf
+	install -D -m 0644 src/systemd/pve-gpu-vfio.service \
+		$(DESTDIR)/lib/systemd/system/pve-gpu-vfio.service
 	# APT hook
 	install -D -m 0644 config/99-pve-gpu-reapply \
 		$(DESTDIR)/etc/apt/apt.conf.d/99-pve-gpu-reapply
@@ -42,4 +49,6 @@ clean:
 	rm -rf debian/.debhelper
 	rm -f debian/debhelper-build-stamp
 	rm -f debian/files
-	rm -f ../*.deb ../*.buildinfo ../*.changes
+	rm -f ../pve-gpu-manager_*.deb
+	rm -f ../pve-gpu-manager_*.buildinfo
+	rm -f ../pve-gpu-manager_*.changes
