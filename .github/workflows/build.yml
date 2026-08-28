@@ -19,11 +19,15 @@ jobs:
         run: prove -r t/
 
       - name: Build .deb package
-        run: make deb
+        run: |
+          make deb
+          mkdir -p dist
+          cp ../pve-gpu-manager_*.deb dist/
 
       - name: Verify package
         run: |
-          DEB=$(ls ../*.deb | head -1)
+          DEB=$(find dist -maxdepth 1 -name 'pve-gpu-manager_*.deb' -print -quit)
+          test -n "$DEB"
           echo "Package: $DEB"
           dpkg-deb -I "$DEB"
           dpkg-deb -c "$DEB"
@@ -32,5 +36,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: pve-gpu-manager-deb
-          path: ../*.deb
+          path: dist/*.deb
           retention-days: 30

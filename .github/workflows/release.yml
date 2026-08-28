@@ -21,7 +21,10 @@ jobs:
         run: prove -r t/
 
       - name: Build .deb package
-        run: make deb
+        run: |
+          make deb
+          mkdir -p dist
+          cp ../pve-gpu-manager_*.deb dist/
 
       - name: Get version from tag
         id: version
@@ -50,6 +53,6 @@ jobs:
             dpkg -r pve-gpu-manager
             ```
           files: |
-            ../*.deb
+            dist/*.deb
           draft: false
           prerelease: false
