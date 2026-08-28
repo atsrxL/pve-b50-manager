@@ -62,6 +62,38 @@ sub replace_symlink {
     symlink($target, $link) or die "Cannot symlink $link -> $target: $!";
 }
 
+sub write_valid_sriov_config {
+    write_file($sriov_config, <<"SRIOV_CONFIG");
+[$pf]
+allow_unsafe_scheduler = 0
+api_version = 2
+device_id = 0xe212
+drivers_autoprobe = 0
+family = bmg
+num_vfs = 2
+persist = 1
+sched_priority = low
+
+[$pf/vf1]
+contexts_mode = auto
+doorbells_mode = auto
+driver =
+exec_quantum_ms_mode = auto
+ggtt_mode = auto
+preempt_timeout_us_mode = auto
+vram_mode = auto
+
+[$pf/vf2]
+contexts_mode = auto
+doorbells_mode = auto
+driver =
+exec_quantum_ms_mode = auto
+ggtt_mode = auto
+preempt_timeout_us_mode = auto
+vram_mode = auto
+SRIOV_CONFIG
+}
+
 # A minimal xe/BMG PF and two VFs.  Assignment only needs the live VF
 # topology, but the resource directories are present so the response's VF
 # record can be built without touching a real debugfs tree.
@@ -81,18 +113,7 @@ make_path("$root/sys/module/xe", "$root/sys/class/drm/card0");
 replace_symlink("$root/sys/module/xe", "$pf_path/driver");
 replace_symlink($pf_path, "$root/sys/class/drm/card0/device");
 write_file("$root/proc/cpuinfo", "flags: vmx\n");
-write_file($sriov_config, <<"SRIOV_CONFIG");
-[$pf]
-api_version = 2
-num_vfs = 2
-persist = 1
-
-[$pf/vf1]
-driver =
-
-[$pf/vf2]
-driver =
-SRIOV_CONFIG
+write_valid_sriov_config();
 
 for my $index (1 .. 2) {
     my $vf_bdf = $vf_bdfs[$index - 1];
@@ -537,25 +558,98 @@ ok(!$result, 'a VM inventory change during reservation locking is rejected');
 like($error, qr/QEMU VM set changed/i, 'VM inventory race is reported explicitly');
 ok(!exists($vm_config{801}{hostpci0}), 'VM inventory race performs no target write');
 
-# VM assignment is a persistent operation.  A live VF without a complete
-# PF/VF boot profile must be rejected instead of silently creating an
-# assignment which disappears or fails after reboot.
-reset_vms();
-set_vm(901, {});
-write_file($sriov_config, <<"INCOMPLETE_CONFIG");
-[$pf]
-api_version = 2
-num_vfs = 2
-persist = 1
+# VM assignment is a persistent operation.  Its profile must be the same
+# complete, boot-restorable state that apply-sriov-config accepts.
+subtest 'assignment requires a boot-restorable PF/VF profile' => sub {
+    my @invalid_profiles = (
+        [
+            'persistence is disabled',
+            sub { $_[0]->{$pf}{persist} = 0 },
+            qr/persistent SR-IOV profile/,
+        ],
+        [
+            'API version is stale',
+            sub { $_[0]->{$pf}{api_version} = 1 },
+            qr/api_version=2/,
+        ],
+        [
+            'persisted VF topology differs from live topology',
+            sub { $_[0]->{$pf}{num_vfs} = 1 },
+            qr/does not match the live VF topology/,
+        ],
+        [
+            'driver autoprobe policy is missing',
+            sub { delete $_[0]->{$pf}{drivers_autoprobe} },
+            qr/invalid drivers_autoprobe/,
+        ],
+        [
+            'normal scheduler lacks its acknowledgement',
+            sub { $_[0]->{$pf}{sched_priority} = 'normal' },
+            qr/invalid scheduler policy/,
+        ],
+        [
+            'persisted family is not the live BMG family',
+            sub { $_[0]->{$pf}{family} = 'flex' },
+            qr/supported BMG family/,
+        ],
+        [
+            'another live VF has an incomplete resource profile',
+            sub { delete $_[0]->{"$pf/vf2"}{contexts_mode} },
+            qr/VF2 resource 'contexts' mode/,
+        ],
+        [
+            'a BMG VF requests the legacy i915 driver',
+            sub { $_[0]->{"$pf/vf2"}{driver} = 'i915' },
+            qr/VF2 has unsupported driver 'i915'/,
+        ],
+    );
 
-[$pf/vf2]
-driver =
-INCOMPLETE_CONFIG
-($result, $error) = assign_vf($pf, 1, 901);
-ok(!$result, 'assignment rejects an incomplete persistent VF profile');
-like($error, qr/profile is incomplete/i,
-    'incomplete persistence rejection explains how to repair the profile');
-ok(!exists($vm_config{901}{hostpci0}),
-    'incomplete persistence rejection leaves the VM config unchanged');
+    for my $case (@invalid_profiles) {
+        my ($label, $mutate, $pattern) = @$case;
+        reset_vms();
+        set_vm(901, {});
+        write_valid_sriov_config();
+        my $profile = PVE::API2::Hardware::GPU::parse_ini_config(
+            $sriov_config,
+            1,
+        );
+        $mutate->($profile);
+        PVE::API2::Hardware::GPU::write_ini_config($sriov_config, $profile);
+
+        my ($got, $why) = assign_vf($pf, 1, 901);
+        ok(!$got, "$label is rejected");
+        like($why, $pattern, "$label reports the profile invariant");
+        ok(!exists($vm_config{901}{hostpci0}),
+            "$label leaves the VM config unchanged");
+    }
+
+    reset_vms();
+    set_vm(902, {});
+    write_valid_sriov_config();
+    my ($assigned, $assign_error) = assign_vf($pf, 1, 902);
+    ok($assigned && !$assign_error, 'fixture VF is assigned before clear test')
+        or diag($assign_error);
+    my $profile = PVE::API2::Hardware::GPU::parse_ini_config($sriov_config, 1);
+    $profile->{$pf}{persist} = 0;
+    PVE::API2::Hardware::GPU::write_ini_config($sriov_config, $profile);
+    my ($cleared, $clear_error) = assign_vf($pf, 1, 0);
+    ok($cleared && !$clear_error,
+        'unassignment remains available after persistence is disabled')
+        or diag($clear_error);
+    ok(!exists($vm_config{902}{hostpci0}),
+        'recovery unassignment removes the VM hostpci entry');
+    is($mock_driver{$vf_bdfs[0]}, '',
+        'recovery unassignment leaves the VF unbound');
+    my $after_clear = PVE::API2::Hardware::GPU::parse_ini_config(
+        $sriov_config,
+        1,
+    );
+    is($after_clear->{$pf}{persist}, 0,
+        'recovery unassignment does not rewrite the invalid profile');
+    is($after_clear->{"$pf/vf1"}{driver}, 'vfio-pci',
+        'recovery unassignment skips persistence mutation for an invalid profile');
+};
+
+write_valid_sriov_config();
 
 done_testing();

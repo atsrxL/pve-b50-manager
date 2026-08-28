@@ -10,15 +10,6 @@ use PVE::GPU::SRIOV qw(active_sched_priority);
 # Device family map
 # ---------------------------------------------------------------------------
 my $DEVICE_FAMILIES = {
-    '0x56c0' => { family => 'flex',     max_vfs => 31, tiles => 1 },
-    '0x56c1' => { family => 'flex',     max_vfs => 31, tiles => 1 },
-    '0x56c2' => { family => 'flex',     max_vfs => 31, tiles => 1 },
-    '0x0bd4' => { family => 'pvc',      max_vfs => 62, tiles => 2 },
-    '0x0bd5' => { family => 'pvc',      max_vfs => 62, tiles => 2 },
-    '0x0bd6' => { family => 'pvc',      max_vfs => 62, tiles => 2 },
-    '0x0bda' => { family => 'pvc_ext',  max_vfs => 63, tiles => 2 },
-    '0x0bdb' => { family => 'pvc_ext',  max_vfs => 63, tiles => 2 },
-    '0x0b6e' => { family => 'pvc_ext',  max_vfs => 63, tiles => 2 },
     '0xe211' => { family => 'bmg',      max_vfs => 24, tiles => 1 },
     '0xe212' => { family => 'bmg',      max_vfs => 24, tiles => 1 },
     '0xe222' => { family => 'bmg',      max_vfs => 24, tiles => 1 },
@@ -27,15 +18,6 @@ my $DEVICE_FAMILIES = {
 
 # Fallback device name map when lspci is unavailable
 my $DEVICE_NAMES = {
-    '0x56c0' => 'Intel Data Center GPU Flex 170',
-    '0x56c1' => 'Intel Data Center GPU Flex 140',
-    '0x56c2' => 'Intel Data Center GPU Flex 140 (2T)',
-    '0x0bd4' => 'Intel Data Center GPU Max 1550',
-    '0x0bd5' => 'Intel Data Center GPU Max 1100',
-    '0x0bd6' => 'Intel Data Center GPU Max 1100C',
-    '0x0bda' => 'Intel Data Center GPU Max 1450',
-    '0x0bdb' => 'Intel Data Center GPU Max 1350',
-    '0x0b6e' => 'Intel Data Center GPU Max (PVC-XT)',
     '0xe211' => 'Intel Arc Pro B60 (Battlemage G21)',
     '0xe212' => 'Intel Arc Pro B50 (Battlemage G21)',
     '0xe222' => 'Intel Battlemage GPU G21',
@@ -449,10 +431,11 @@ sub prepare_auto_provisioning {
 }
 
 sub read_scheduler_priority {
-    my ($class, $bdf, $vf_index) = @_;
-    $vf_index //= 1;
+    my ($class, $bdf, $function_index) = @_;
+    $function_index //= 0;
+    my $function = $function_index == 0 ? 'pf' : "vf$function_index";
     my $raw = PVE::API2::Hardware::GPU::read_sysfs(
-        "/sys/bus/pci/devices/$bdf/sriov_admin/vf$vf_index/profile/sched_priority"
+        "/sys/bus/pci/devices/$bdf/sriov_admin/$function/profile/sched_priority"
     );
     return active_sched_priority($raw);
 }
@@ -536,7 +519,7 @@ sub read_firmware_version {
 # ---------------------------------------------------------------------------
 sub native_drivers {
     my ($class) = @_;
-    return ['xe', 'i915'];
+    return ['xe'];
 }
 
 # ---------------------------------------------------------------------------
@@ -546,12 +529,12 @@ sub native_drivers {
 sub run_prechecks {
     my ($class, $bdf, $card, $driver) = @_;
 
-    my $pass = ($driver eq 'i915' || $driver eq 'xe') ? 1 : 0;
+    my $pass = $driver eq 'xe' ? 1 : 0;
     return {
         pass   => $pass ? \1 : \0,
         detail => $pass
             ? "$driver driver bound"
-            : "Driver '$driver' bound (expected i915 or xe)",
+            : "Driver '$driver' bound (expected xe)",
     };
 }
 

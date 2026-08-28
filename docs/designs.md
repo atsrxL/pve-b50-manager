@@ -1,5 +1,9 @@
 # PVE GPU/GPU Manager — UI Mockups & Workflow Diagrams
 
+> Historical upstream mockups. The current UI and supported Battlemage/xe scope
+> are documented in `README.md`; Flex/i915 screens below are retained only as
+> design history.
+
 ## 1. UI Mockups
 
 ### 1.1 Node Tab — GPU/GPU Main View

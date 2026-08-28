@@ -120,7 +120,7 @@ is(is_vf('0000:03:00.3'), 1, 'VF 0000:03:00.3 has physfn symlink');
 is(is_vf('0000:04:00.0'), 0, 'PF 0000:04:00.0 is not a VF');
 
 # ---------------------------------------------------------------------------
-# Test 2: Driver detection — accept both i915 and xe
+# Test 2: Driver detection — the supported BMG path requires xe
 # ---------------------------------------------------------------------------
 
 sub get_driver {
@@ -132,22 +132,21 @@ sub get_driver {
 
 sub is_valid_gpu_driver {
     my ($driver) = @_;
-    return ($driver eq 'i915' || $driver eq 'xe') ? 1 : 0;
+    return $driver eq 'xe' ? 1 : 0;
 }
 
 is(get_driver('0000:03:00.0'), 'i915', 'Flex PF has i915 driver');
 is(get_driver('0000:04:00.0'), 'xe',   'BMG PF has xe driver');
-is(is_valid_gpu_driver('i915'), 1, 'i915 is a valid GPU driver');
+is(is_valid_gpu_driver('i915'), 0, 'i915 is outside the supported BMG path');
 is(is_valid_gpu_driver('xe'),   1, 'xe is a valid GPU driver');
 is(is_valid_gpu_driver('vfio-pci'), 0, 'vfio-pci is not a valid GPU driver');
 is(is_valid_gpu_driver(''),     0, 'empty string is not a valid GPU driver');
 
 # ---------------------------------------------------------------------------
-# Test 3: Device enumeration — only PFs with known Intel device IDs
+# Test 3: Device enumeration — only the fully supported BMG IDs
 # ---------------------------------------------------------------------------
 
 my $DEVICE_FAMILIES = {
-    '0x56c0' => { family => 'flex',     max_vfs => 31, tiles => 1 },
     '0xe211' => { family => 'bmg',      max_vfs => 24, tiles => 1 },
 };
 
@@ -178,9 +177,10 @@ sub enumerate_test {
 }
 
 my @found = enumerate_test();
-is(scalar @found, 2, 'enumerate finds exactly 2 PF devices');
-is($found[0], '0000:03:00.0', 'first device is Flex PF');
-is($found[1], '0000:04:00.0', 'second device is BMG PF');
+is(scalar @found, 1, 'enumerate finds exactly one supported PF device');
+is($found[0], '0000:04:00.0', 'BMG PF is enumerated');
+ok(!scalar(grep { $_ eq '0000:03:00.0' } @found),
+    'Flex PF is not exposed by the BMG-only manager');
 
 # ---------------------------------------------------------------------------
 # Test 4: Telemetry — temperature reading from hwmon

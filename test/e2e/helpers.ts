@@ -75,17 +75,17 @@ export async function openGpuTab(page: Page) {
 }
 
 /**
- * Open the Create VFs dialog for device 0000:03:00.0
+ * Open the VF editor for the supported BMG fixture.
  */
-export async function openCreateVfsDialog(page: Page) {
+export async function openModifyVfsDialog(page: Page) {
     await openGpuTab(page);
 
-    // Click the Flex 170 device row
-    await page.locator('text=0000:03:00.0').first().click();
+    await page.locator('text=0000:04:00.0').first().click();
     await page.waitForTimeout(1000);
 
-    // Click Create VFs button
-    await page.locator('.x-btn-inner:has-text("Create")').first().click();
+    const modifyButton = page.locator('.x-btn:has(.x-btn-inner:text-is("Modify VFs"))').first();
+    await expect(modifyButton).toBeEnabled({ timeout: 10000 });
+    await modifyButton.click();
 
     // Wait for dialog
     const dialog = page.locator('.x-window').last();

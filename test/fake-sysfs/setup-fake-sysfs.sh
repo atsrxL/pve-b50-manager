@@ -75,7 +75,11 @@ chmod 444 "$ROOT/proc/cpuinfo"
 mkdir -p "$ROOT/sys/class/iommu/dmar0"
 
 # ---------------------------------------------------------------------------
-# Flex 170 GPU — BDF 0000:03:00.0
+# Unsupported Flex 170 negative control — BDF 0000:03:00.0
+#
+# The Intel backend intentionally supports Battlemage only.  Keep this PCI
+# function present so enumeration tests prove that an Intel GPU with an
+# unsupported device ID is ignored.
 # ---------------------------------------------------------------------------
 PF0="$ROOT/sys/bus/pci/devices/0000:03:00.0"
 mkdir -p "$PF0"
@@ -145,7 +149,7 @@ done
 ln -sfn "$IOV" "$PF0/iov"
 
 # ---------------------------------------------------------------------------
-# BMG GPU — BDF 0000:04:00.0
+# Supported BMG GPU — BDF 0000:04:00.0
 # ---------------------------------------------------------------------------
 PF1="$ROOT/sys/bus/pci/devices/0000:04:00.0"
 mkdir -p "$PF1"
@@ -158,6 +162,7 @@ mkfile "$PF1/numa_node"               "0"
 mkfile "$PF1/sriov_totalvfs"          "24"
 mkfile "$PF1/sriov_numvfs"            "0"
 mkfile "$PF1/sriov_drivers_autoprobe" "1"
+mkfile "$PF1/driver_override"          ""
 
 # BMG uses the xe driver
 mkdir -p "$ROOT/sys/module/xe"
@@ -165,16 +170,66 @@ ln -sfn "../../../../module/xe" "$PF1/driver"
 
 mkdir -p "$PF1/drm/renderD129"
 
-# DRM class entry for card1
+# DRM class entries for card1 and its render node
 mkdir -p "$ROOT/sys/class/drm/card1"
 ln -sfn "$PF1" "$ROOT/sys/class/drm/card1/device"
+mkdir -p "$ROOT/sys/class/drm/renderD129"
+ln -sfn "$PF1" "$ROOT/sys/class/drm/renderD129/device"
 
-# Debugfs paths for BMG
+# Deterministic BMG telemetry exposed through card1/device.
+mkdir -p "$PF1/hwmon/hwmon1"
+mkfile "$PF1/hwmon/hwmon1/temp1_label"  "GPU"
+mkfile "$PF1/hwmon/hwmon1/temp1_input"  "43000"
+mkfile "$PF1/hwmon/hwmon1/temp2_label"  "Memory"
+mkfile "$PF1/hwmon/hwmon1/temp2_input"  "55000"
+mkfile "$PF1/hwmon/hwmon1/power1_input" "48000000"
+mkfile "$PF1/tile0/gt0/freq0/act_freq"  "2100"
+mkfile "$PF1/tile0/gt0/freq0/max_freq"  "2400"
+
+# Current xe SR-IOV debugfs layout for BMG.
 DBG="$ROOT/sys/kernel/debug/dri/0000:04:00.0"
-mkfile "$DBG/gt0/vf1/lmem_quota" "0"
-mkfile "$DBG/gt0/vf2/lmem_quota" "0"
-mkfile "$DBG/gt0/pf/lmem_spare"  "134217728"
-mkfile "$DBG/gt0/pf/lmem_provisioned" ""
+SRIOV="$DBG/sriov"
+mkfile "$SRIOV/restore_auto_provisioning" "1"
+mkfile "$SRIOV/pf/tile0/vram_spare"       "134217728"
+mkfile "$SRIOV/pf/tile0/ggtt_spare"       "268435456"
+for gt in 0 1; do
+    mkfile "$SRIOV/pf/tile0/gt$gt/contexts_spare"  "32768"
+    mkfile "$SRIOV/pf/tile0/gt$gt/doorbells_spare" "128"
+done
+
+# Dormant VF controls and PCI identities.  sriov_numvfs remains zero, so these
+# are not enumerated as live VFs; they model the control files exposed by xe.
+for vf in 1 2 3 4; do
+    VF_BDF="0000:04:00.$vf"
+    VF="$ROOT/sys/bus/pci/devices/$VF_BDF"
+    mkdir -p "$VF"
+    mkfile "$VF/vendor"          "0x8086"
+    mkfile "$VF/device"          "0xe211"
+    mkfile "$VF/driver_override" ""
+    ln -sfn "../0000:04:00.0" "$VF/physfn"
+    ln -sfn "../$VF_BDF" "$PF1/virtfn$((vf - 1))"
+
+    VF_TILE="$SRIOV/vf$vf/tile0"
+    mkfile "$VF_TILE/vram_quota" "4294967296"
+    mkfile "$VF_TILE/ggtt_quota" "1073741824"
+    for gt in 0 1; do
+        mkfile "$VF_TILE/gt$gt/contexts_quota"        "16384"
+        mkfile "$VF_TILE/gt$gt/doorbells_quota"       "64"
+        mkfile "$VF_TILE/gt$gt/exec_quantum_ms"       "8"
+        mkfile "$VF_TILE/gt$gt/preempt_timeout_us"    "5000"
+        mkfile "$VF_TILE/gt$gt/sched_priority"        "0"
+    done
+done
+
+# xe scheduler profile interface used by status/capability discovery.
+mkfile "$PF1/sriov_admin/.bulk_profile/sched_priority" "[low] normal"
+mkfile "$PF1/sriov_admin/pf/profile/sched_priority"    "[low] normal"
+for vf in 1 2 3 4; do
+    mkfile "$PF1/sriov_admin/vf$vf/profile/sched_priority" "[low] normal"
+done
+
+# Firmware version exposed by the detail endpoint.
+mkfile "$DBG/gt0/uc/guc_info" "GuC firmware: found release version 70.44.1"
 
 # VRAM info
 cat > "$DBG/vram0_mm" << 'VRAMEOF'
@@ -193,12 +248,10 @@ echo ""
 echo "Fake sysfs tree created at: $ROOT"
 echo ""
 echo "Devices:"
-echo "  Flex 170 (0x56c0)  BDF=0000:03:00.0  card=card0  render=renderD128  driver=i915"
-echo "    SR-IOV totalvfs=31  VF stubs: 0000:03:00.1..4 (with physfn)"
-echo "    IOV: $IOV"
-echo "    hwmon: temp=42°C  power=65.3W"
-echo "  BMG    (0xe211)  BDF=0000:04:00.0  card=card1  render=renderD129  driver=xe"
-echo "    SR-IOV totalvfs=24"
+echo "  Flex 170 (0x56c0)  BDF=0000:03:00.0  unsupported negative control"
+echo "  BMG      (0xe211)  BDF=0000:04:00.0  card=card1  render=renderD129  driver=xe"
+echo "    SR-IOV totalvfs=24  numvfs=0  scheduler=low"
 echo "    debugfs: $DBG  vram=25669140480 bytes"
+echo "    hwmon: GPU=43°C  VRAM=55°C  power=48W"
 echo ""
 echo "Set PVE_GPU_SYSFS_ROOT=$ROOT to use this tree."

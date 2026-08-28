@@ -3,31 +3,64 @@
 
 set -e
 
+SRIOV_CONF=${PVE_GPU_SRIOV_CONF:-/etc/pve/local/gpu-sriov.conf}
+TEMPLATE_CONF=${PVE_GPU_TEMPLATE_CONF:-/etc/pve/local/gpu-vf-templates.conf}
+LEGACY_MODPROBE_CONF=${PVE_GPU_LEGACY_MODPROBE_CONF:-/etc/modprobe.d/pve-gpu-vfio.conf}
+LEGACY_MODULES_CONF=${PVE_GPU_LEGACY_MODULES_CONF:-/etc/modules-load.d/pve-gpu-vfio.conf}
+VFIO_CONF=${PVE_GPU_VFIO_CONF:-/etc/pve-gpu-vfio.conf}
+SYSFS_ROOT_CONF=${PVE_GPU_SYSFS_ROOT_CONF:-/etc/pve-gpu-sysfs-root}
+GRUB_DEFAULT=${PVE_GPU_GRUB_DEFAULT:-/etc/default/grub}
+INDEX_BACKUP=${PVE_GPU_INDEX_BACKUP:-/usr/share/pve-manager/index.html.tpl.pre-gpu}
+HARDWARE_BACKUP=${PVE_GPU_HARDWARE_BACKUP:-/usr/share/perl5/PVE/API2/Hardware.pm.pre-gpu}
+NODES_BACKUP=${PVE_GPU_NODES_BACKUP:-/usr/share/perl5/PVE/API2/Nodes.pm.pre-gpu}
+
 log() {
     logger -t pve-gpu-postrm "$@" 2>/dev/null || true
     echo "pve-gpu-postrm: $*"
 }
 
+has_package_owned_grub_vfio_ids() {
+    [ -f "$GRUB_DEFAULT" ] || return 1
+    grub_line=$(grep '^GRUB_CMDLINE_LINUX_DEFAULT=' "$GRUB_DEFAULT") || return 1
+    printf '%s\n' "$grub_line" |
+        grep -Eq "(^|[[:space:]])intel_iommu=on([[:space:]]|[\"'])" || return 1
+    printf '%s\n' "$grub_line" |
+        grep -Eq "(^|[[:space:]])iommu=pt([[:space:]]|[\"'])" || return 1
+    printf '%s\n' "$grub_line" |
+        grep -Eq "(^|[[:space:]])vfio-pci\\.ids=8086:(56c0|56c1|56c2|0bd4|0bd5|0bd6|0bda|0bdb|0b6e|e211|e212|e222|e223)(,8086:(56c0|56c1|56c2|0bd4|0bd5|0bd6|0bda|0bdb|0b6e|e211|e212|e222|e223))*[\"'][[:space:]]*$"
+}
+
 case "$1" in
     purge)
-        legacy_blacklist=0
-        if [ -f /etc/modprobe.d/pve-gpu-vfio.conf ]; then
-            legacy_blacklist=1
+        legacy_vfio_policy=0
+        legacy_grub_policy=0
+        if [ -e "$LEGACY_MODPROBE_CONF" ] ||
+           [ -e "$LEGACY_MODULES_CONF" ]; then
+            legacy_vfio_policy=1
         fi
-        rm -f /etc/pve/local/gpu-sriov.conf
-        rm -f /etc/pve/local/gpu-vf-templates.conf
-        rm -f /etc/modprobe.d/pve-gpu-vfio.conf
-        rm -f /etc/modules-load.d/pve-gpu-vfio.conf
-        rm -f /etc/pve-gpu-vfio.conf
-        rm -f /etc/pve-gpu-sysfs-root
+        if [ "$legacy_vfio_policy" = 1 ] &&
+           has_package_owned_grub_vfio_ids; then
+            perl -pi -e "if (/^GRUB_CMDLINE_LINUX_DEFAULT=/) { s/[ \t]+vfio-pci\.ids=[^ \t\r\n\"']+//g }" "$GRUB_DEFAULT"
+            legacy_grub_policy=1
+        fi
+        rm -f "$SRIOV_CONF"
+        rm -f "$TEMPLATE_CONF"
+        rm -f "$LEGACY_MODPROBE_CONF"
+        rm -f "$LEGACY_MODULES_CONF"
+        rm -f "$VFIO_CONF"
+        rm -f "$SYSFS_ROOT_CONF"
 
         # Old package versions created these whole-file backups. They are never
         # restored because doing so could downgrade files owned by Proxmox.
-        rm -f /usr/share/pve-manager/index.html.tpl.pre-gpu
-        rm -f /usr/share/perl5/PVE/API2/Hardware.pm.pre-gpu
-        rm -f /usr/share/perl5/PVE/API2/Nodes.pm.pre-gpu
+        rm -f "$INDEX_BACKUP"
+        rm -f "$HARDWARE_BACKUP"
+        rm -f "$NODES_BACKUP"
 
-        if [ "$legacy_blacklist" = 1 ] && command -v update-initramfs >/dev/null 2>&1; then
+        if [ "$legacy_grub_policy" = 1 ] && command -v update-grub >/dev/null 2>&1; then
+            update-grub \
+                || log "WARNING: Failed to remove the legacy vfio-pci.ids argument from GRUB"
+        fi
+        if [ "$legacy_vfio_policy" = 1 ] && command -v update-initramfs >/dev/null 2>&1; then
             update-initramfs -u \
                 || log "WARNING: Failed to remove the legacy GPU blacklist from initramfs"
         fi

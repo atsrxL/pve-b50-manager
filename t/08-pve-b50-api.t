@@ -97,6 +97,7 @@ for my $gt (0 .. 1) {
     write_file("$pf_debug/gt$gt/doorbells_spare", 8);
 }
 write_file("$root/sys/kernel/debug/dri/$pf/sriov/restore_auto_provisioning", 0);
+write_file("$pf_path/sriov_admin/pf/profile/sched_priority", '[low] normal');
 write_file("$pf_path/sriov_admin/vf1/profile/sched_priority", '[low] normal');
 write_file("$pf_path/sriov_admin/vf2/profile/sched_priority", '[low] normal');
 write_file("$pf_path/sriov_admin/.bulk_profile/sched_priority", 'low');
@@ -218,14 +219,44 @@ like($@, qr/requires allow_unsafe_scheduler=1/,
 
 my $live_rec = PVE::API2::Hardware::GPU::_collect_device($pf, 0);
 is(PVE::API2::Hardware::GPU::_read_scheduler_priority($live_rec), 'low',
-    'scheduler read requires and reports the same value from every VF');
+    'scheduler read requires the same value from the PF and every VF');
 write_file("$pf_path/sriov_admin/vf2/profile/sched_priority", '[normal] low');
 is(PVE::API2::Hardware::GPU::_read_scheduler_priority($live_rec), 'mixed',
     'mixed per-VF scheduler state is reported explicitly');
+write_file("$pf_path/sriov_admin/vf2/profile/sched_priority", '[low] normal');
+write_file("$pf_path/sriov_admin/pf/profile/sched_priority", '[normal] low');
+is(PVE::API2::Hardware::GPU::_read_scheduler_priority($live_rec), 'mixed',
+    'a PF scheduler mismatch is reported explicitly');
 eval { PVE::API2::Hardware::GPU::_snapshot_state($live_rec) };
 like($@, qr/consistent BMG scheduler profile/,
-    'a transaction cannot snapshot and overwrite mixed scheduler state');
-write_file("$pf_path/sriov_admin/vf2/profile/sched_priority", '[low] normal');
+    'a transaction cannot snapshot and overwrite a mismatched PF scheduler');
+
+my $scheduler_writes = 0;
+{
+    no warnings 'redefine';
+    local *PVE::API2::Hardware::GPU::Intel::set_scheduler_priority = sub {
+        $scheduler_writes++;
+        write_file("$pf_path/sriov_admin/vf1/profile/sched_priority", '[low] normal');
+        write_file("$pf_path/sriov_admin/vf2/profile/sched_priority", '[low] normal');
+        return 1;
+    };
+    eval { PVE::API2::Hardware::GPU::_set_scheduler_priority($live_rec, 'low') };
+    like($@, qr/Scheduler verification failed.*mixed/,
+        'scheduler verification fails when a bulk update leaves the PF unchanged');
+}
+is($scheduler_writes, 1,
+    'a matching VF state does not short-circuit a mismatched PF scheduler');
+{
+    no warnings 'redefine';
+    local *PVE::API2::Hardware::GPU::Intel::set_scheduler_priority = sub {
+        write_file("$pf_path/sriov_admin/pf/profile/sched_priority", '[low] normal');
+        write_file("$pf_path/sriov_admin/vf1/profile/sched_priority", '[low] normal');
+        write_file("$pf_path/sriov_admin/vf2/profile/sched_priority", '[low] normal');
+        return 1;
+    };
+    eval { PVE::API2::Hardware::GPU::_set_scheduler_priority($live_rec, 'low') };
+    is($@, '', 'scheduler verification succeeds only after PF and all VFs match');
+}
 
 my $live_vfs = PVE::API2::Hardware::GPU::_vf_records($live_rec);
 my $missing_persistence = PVE::API2::Hardware::GPU::_calculate_persistence_drift(
@@ -249,6 +280,41 @@ ok($unreadable_scheduler->{scheduler} &&
     $unreadable_scheduler->{scheduler_unreadable},
     'an unreadable live scheduler is reported as drift');
 
+subtest 'persistence cannot be removed while PF/VF assignments remain' => sub {
+    my $before = read_file($config);
+    for my $consumer (
+        [$pf, 'PF'],
+        ['0000:0b:00.1', 'VF'],
+    ) {
+        write_file(
+            "$qemu_dir/999.conf",
+            "hostpci0: $consumer->[0],rombar=0\n",
+        );
+        {
+            no warnings 'redefine';
+            local *PVE::API2::Hardware::GPU::_with_vm_locks = sub {
+                my ($vmids, $code) = @_;
+                return $code->();
+            };
+            local *PVE::API2::Hardware::GPU::_vm_is_running = sub { return 0 };
+            eval {
+                PVE::API2::Hardware::GPU::_configure_sriov_v2($pf, {
+                    num_vfs => 2,
+                    vf_profiles => encode_json($profiles),
+                    sched_priority => 'unchanged',
+                    drivers_autoprobe => 0,
+                    persist => 0,
+                });
+            };
+        }
+        like($@, qr/Cannot disable SR-IOV persistence.*VM999/,
+            "$consumer->[1] assignment blocks persist=0");
+        is(read_file($config), $before,
+            "$consumer->[1] rejection preserves the persistent profile");
+    }
+    unlink("$qemu_dir/999.conf") or die $!;
+};
+
 write_file("$qemu_dir/999.conf", "hostpci0: definitely-not-a-bdf\n");
 eval {
     PVE::API2::Hardware::GPU::check_vf_vm_assignments($pf, 'card0', 2, 1);
@@ -263,9 +329,15 @@ is(PVE::API2::Hardware::GPU::_scheduler_for_transaction(
     'low',
     'topology rebuild resolves unchanged to the snapshotted scheduler');
 is(PVE::API2::Hardware::GPU::_scheduler_for_transaction(
-        'unchanged', 1, { count => 0, scheduler => undef }, 2),
-    'low',
-    'first VF creation resolves unchanged to the safe low scheduler');
+        'unchanged', 1, { count => 0, scheduler => 'normal' }, 2),
+    'normal',
+    'first VF creation preserves the snapshotted PF scheduler');
+eval {
+    PVE::API2::Hardware::GPU::_scheduler_for_transaction(
+        'unchanged', 1, { count => 0, scheduler => undef }, 2);
+};
+like($@, qr/Cannot preserve an unreadable or mixed scheduler/,
+    'first VF creation cannot replace an unreadable PF scheduler with low');
 eval {
     PVE::API2::Hardware::GPU::_scheduler_for_transaction(
         'unchanged', 1, { count => 2, scheduler => 'mixed' }, 2);
@@ -289,5 +361,121 @@ eval { PVE::API2::Hardware::GPU::_collect_device($pf, 0) };
 like($@, qr/Cannot read a valid non-negative integer/,
     'a missing live VF count fails closed instead of becoming zero');
 write_file("$pf_path/sriov_numvfs", 2);
+
+for my $unsupported (
+    ['0000:0c:00.0', '0x10de', '0x1287', 'unregistered Nvidia device'],
+    ['0000:0d:00.0', '0x8086', '0x56c0', 'unsupported Intel Flex device'],
+) {
+    my ($bdf, $vendor, $device, $label) = @$unsupported;
+    write_file("$root/sys/bus/pci/devices/$bdf/vendor", $vendor);
+    write_file("$root/sys/bus/pci/devices/$bdf/device", $device);
+    my $record;
+    eval { $record = PVE::API2::Hardware::GPU::_collect_device($bdf, 0) };
+    is($@, '', "$label is skipped without reading absent SR-IOV controls");
+    is($record, undef, "$label is not enumerated");
+}
+
+my $persist_flag_config = PVE::API2::Hardware::GPU::parse_ini_config($config, 1);
+$persist_flag_config->{$pf}{persist} = 0;
+PVE::API2::Hardware::GPU::write_ini_config($config, $persist_flag_config);
+my $not_persisted = PVE::API2::Hardware::GPU::_collect_device($pf, 0);
+ok(!$not_persisted->{persisted},
+    'device grid persistence follows persist=0 rather than section presence');
+my $disabled_vfs = PVE::API2::Hardware::GPU::_vf_records($not_persisted);
+is($disabled_vfs->[0]{resources}{vram}{mode}, 'unknown',
+    'a disabled device section is not used as VF resource provenance');
+my $disabled_drift = PVE::API2::Hardware::GPU::_calculate_persistence_drift(
+    $not_persisted,
+    $persist_flag_config,
+    $disabled_vfs,
+    'low',
+);
+ok($disabled_drift->{has_drift} && $disabled_drift->{persistence},
+    'persist=0 is reported as non-restorable configuration drift');
+ok(PVE::API2::Hardware::GPU::_profiles_require_auto_reprovision(
+        $not_persisted,
+        $auto_profiles,
+        $persist_flag_config,
+    ),
+    'auto mode cannot trust a disabled persisted profile');
+ok(!PVE::API2::Hardware::GPU::_profiles_require_auto_reprovision(
+        $not_persisted,
+        $profiles,
+        $persist_flag_config,
+    ),
+    'all-custom profiles do not require reprovision merely because persistence is disabled');
+
+$persist_flag_config->{$pf}{sched_priority} = 'normal';
+$persist_flag_config->{$pf}{allow_unsafe_scheduler} = 1;
+PVE::API2::Hardware::GPU::write_ini_config($config, $persist_flag_config);
+eval {
+    PVE::API2::Hardware::GPU::_persist_profiles(
+        $not_persisted,
+        $profiles,
+        'normal',
+        0,
+        1,
+        0,
+        'unchanged',
+    );
+};
+like($@, qr/requires allow_unsafe_scheduler=1/,
+    'a disabled profile cannot donate its prior normal-scheduler acknowledgement');
+
+$persist_flag_config->{$pf}{persist} = 1;
+$persist_flag_config->{$pf}{sched_priority} = 'low';
+$persist_flag_config->{$pf}{allow_unsafe_scheduler} = 0;
+PVE::API2::Hardware::GPU::write_ini_config($config, $persist_flag_config);
+
+my $invalid_driver_config = PVE::API2::Hardware::GPU::parse_ini_config($config, 1);
+$invalid_driver_config->{"$pf/vf1"}{driver} = 'i915';
+my $invalid_driver_drift = PVE::API2::Hardware::GPU::_calculate_persistence_drift(
+    $live_rec,
+    $invalid_driver_config,
+    $live_vfs,
+    'low',
+);
+ok($invalid_driver_drift->{has_drift} && $invalid_driver_drift->{persistence},
+    'an unsupported persisted BMG VF driver is reported as drift');
+like(join('; ', @{$invalid_driver_drift->{issues}}), qr/VF1.*unsupported.*i915/,
+    'driver drift identifies the invalid VF profile');
+
+my $invalid_ack_config = PVE::API2::Hardware::GPU::parse_ini_config($config, 1);
+$invalid_ack_config->{$pf}{allow_unsafe_scheduler} = 2;
+my $invalid_ack_drift = PVE::API2::Hardware::GPU::_calculate_persistence_drift(
+    $live_rec,
+    $invalid_ack_config,
+    $live_vfs,
+    'low',
+);
+ok($invalid_ack_drift->{has_drift} && $invalid_ack_drift->{scheduler},
+    'an invalid unsafe-scheduler acknowledgement is reported as drift');
+
+my $scheduler_rollback_calls = 0;
+{
+    no warnings 'redefine';
+    local *PVE::API2::Hardware::GPU::_read_sriov_numvfs = sub { return 0 };
+    local *PVE::API2::Hardware::GPU::_set_scheduler_priority = sub {
+        my ($rec, $scheduler) = @_;
+        $scheduler_rollback_calls++ if $scheduler eq 'normal';
+        return 1;
+    };
+    local *PVE::API2::Hardware::GPU::_set_autoprobe = sub { return 1 };
+    my $rollback_errors = PVE::API2::Hardware::GPU::_rollback_state(
+        $live_rec,
+        {
+            count => 0,
+            autoprobe => 1,
+            scheduler => 'normal',
+            path_values => {},
+            drivers => [],
+            config => undef,
+        },
+        0,
+    );
+    is_deeply($rollback_errors, [], 'zero-VF API rollback completes cleanly');
+}
+is($scheduler_rollback_calls, 1,
+    'zero-VF API rollback restores the snapshotted PF scheduler');
 
 done_testing();

@@ -1,5 +1,9 @@
 # PVE GPU/GPU Manager Plugin — Technical Specification
 
+> Historical upstream specification. The shipped implementation is limited to
+> the validated Intel Battlemage IDs and xe ABI documented in `README.md`;
+> Flex/PVC/Nvidia examples below do not describe current runtime support.
+
 ## 1. Introduction
 
 ### 1.1 Purpose

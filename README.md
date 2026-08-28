@@ -7,10 +7,10 @@ true per-VF profiles.
 
 ## B50 / Battlemage support
 
-The implementation recognises Intel Arc Pro B50 (8086:e212) and B60
-(8086:e211) PFs and uses the live sriov_totalvfs value as the effective limit.
-It does not assume that the static family-map maximum is usable on a particular
-card or driver build.
+The implementation recognises the validated Battlemage IDs 8086:e211,
+8086:e212, 8086:e222, and 8086:e223 (including Arc Pro B60 and B50), and uses
+the live sriov_totalvfs value as the effective limit. It does not assume that
+the static family-map maximum is usable on a particular card or driver build.
 
 Current Battlemage resource paths are modelled as:
 
@@ -23,6 +23,7 @@ Current Battlemage resource paths are modelled as:
 
 /sys/kernel/debug/dri/<PF-BDF>/sriov/restore_auto_provisioning
 /sys/bus/pci/devices/<PF-BDF>/sriov_admin/.bulk_profile/sched_priority
+/sys/bus/pci/devices/<PF-BDF>/sriov_admin/{pf,vfN}/profile/sched_priority
 ~~~
 
 GT directories are discovered at runtime. The B50/B60 fallback is GT0 + GT1
@@ -63,13 +64,17 @@ verification.
   A failed change attempts to restore topology, resource values, scheduler,
   driver bindings, autoprobe state, and the prior persistence file.
 - Reprovisioning always creates VFs with driver autoprobe disabled. Quotas and
-  the all-VF scheduler profile are verified before saved drivers are restored.
+  the device-wide PF/VF scheduler profile are verified before saved drivers are
+  restored.
 - Persistence is written only after live verification succeeds.
+- A VF must have a complete boot-restorable profile before it can be assigned
+  to a VM. Persistence cannot be disabled while the PF or a VF remains in any
+  VM configuration; unassignment remains available as a recovery operation if
+  an old profile is incomplete.
 - Removing VFs also removes their boot restore entry, so a reboot cannot
   unexpectedly recreate them.
-- This release accepts one persistent GPU PF per node. Multi-PF boot restore is
-  rejected before any hardware write because cross-PF rollback is not yet
-  transactional.
+- Multiple persistent PFs are validated before the first hardware write. If a
+  later PF fails, already-applied PFs are rolled back in reverse order.
 
 The low scheduler profile is the recommended B50 default. normal is exposed as
 an experimental option only: it requires an explicit confirmation and is
@@ -102,6 +107,15 @@ small, owned marker blocks to the PVE hardware API index and web template.
 Reapplying the integration is idempotent. Package removal removes only those
 marker blocks; it does not restore an old whole-file backup over upgraded PVE
 files.
+
+On upgrade, legacy uniform SR-IOV profiles are migrated to explicit v2 per-VF
+profiles before boot restore is enabled. Obsolete package-owned global VFIO
+blacklist/module-load files and their legacy `vfio-pci.ids=` GRUB argument are
+removed, boot files are refreshed only when that old policy existed, and
+pvedaemon plus pveproxy are restarted so the installed Perl and JavaScript
+integration are used immediately. Other kernel arguments are retained. The
+upgrade does not start the VFIO or SR-IOV boot services and therefore does not
+change live GPU topology.
 
 Do not install a development build on a production node without first reviewing
 the generated package and taking a current PVE configuration backup.
@@ -183,6 +197,10 @@ fake sysfs/config tree. It is skipped on non-PVE machines.
 t/09-vf-assignment.t exercises stopped-VM VF assignment, movement, removal,
 driver reconciliation, conflict handling, and rollback when PVE libraries are
 available.
+
+t/10-sriov-boot-rollback.t covers multi-PF rollback, legacy-profile migration,
+and PF/VF scheduler consistency under Bash 4 or newer. t/11-frontend-logic.t
+covers request ownership and the live-versus-persisted UI state.
 
 Project layout:
 

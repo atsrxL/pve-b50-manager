@@ -67,38 +67,37 @@ run_test "Perl module loads" "perl -I/usr/share/perl5 -MPVE::API2::Hardware::GPU
 
 echo ""
 echo "--- API endpoint tests ---"
-run_test_output "List devices" "0000:03:00.0" \
+run_test_output "List supported BMG device" "0000:04:00.0" \
     "pvesh get /nodes/$HOSTNAME/hardware/gpu --output-format json"
-run_test_output "Device detail" "56c0" \
-    "pvesh get /nodes/$HOSTNAME/hardware/gpu/0000:03:00.0 --output-format json"
-run_test_output "Telemetry temp" "42" \
-    "pvesh get /nodes/$HOSTNAME/hardware/gpu/0000:03:00.0 --output-format json"
-run_test_output "SR-IOV status" "all_pass" \
-    "pvesh get /nodes/$HOSTNAME/hardware/gpu/0000:03:00.0/sriov --output-format json"
-run_test_output "BMG device listed" "0000:04:00.0" \
-    "pvesh get /nodes/$HOSTNAME/hardware/gpu --output-format json"
+run_test "Unsupported Flex is not enumerated" \
+    "! pvesh get /nodes/$HOSTNAME/hardware/gpu --output-format json | grep -q '0000:03:00.0'"
+run_test_output "BMG device detail" "e211" \
+    "pvesh get /nodes/$HOSTNAME/hardware/gpu/0000:04:00.0 --output-format json"
+run_test_output "BMG telemetry temp" "43" \
+    "pvesh get /nodes/$HOSTNAME/hardware/gpu/0000:04:00.0 --output-format json | python3 -c \"import sys,json; print(json.load(sys.stdin)['telemetry']['temperature_c'])\""
+run_test_output "SR-IOV v3 status" "3" \
+    "pvesh get /nodes/$HOSTNAME/hardware/gpu/0000:04:00.0/sriov --output-format json | python3 -c \"import sys,json; print(json.load(sys.stdin)['api_version'])\""
+run_test_output "SR-IOV prechecks pass" "True" \
+    "pvesh get /nodes/$HOSTNAME/hardware/gpu/0000:04:00.0/sriov --output-format json | python3 -c \"import sys,json; print(json.load(sys.stdin)['prechecks']['all_pass'])\""
+run_test_output "BMG scheduler status" "low" \
+    "pvesh get /nodes/$HOSTNAME/hardware/gpu/0000:04:00.0/sriov --output-format json | python3 -c \"import sys,json; print(json.load(sys.stdin)['scheduler_priority'])\""
 
 echo ""
-echo "--- VF lifecycle tests ---"
-run_test "Create 2 VFs" \
-    "pvesh create /nodes/$HOSTNAME/hardware/gpu/0000:03:00.0/sriov --num_vfs 2 --persist 1"
-run_test_output "List VFs" "vf_index" \
-    "pvesh get /nodes/$HOSTNAME/hardware/gpu/0000:03:00.0/vf --output-format json"
-run_test_output "VF detail" "0000:03:00.1" \
-    "pvesh get /nodes/$HOSTNAME/hardware/gpu/0000:03:00.0/vf/1 --output-format json"
-run_test "Remove VFs" \
-    "pvesh delete /nodes/$HOSTNAME/hardware/gpu/0000:03:00.0/sriov"
-
-echo ""
-echo "--- Persistence tests ---"
-run_test "Config file exists" "test -f /etc/pve/local/gpu-sriov.conf"
-run_test_output "Config has BDF" "0000:03:00.0" "cat /etc/pve/local/gpu-sriov.conf"
+echo "--- VF read-only state ---"
+run_test_output "No VFs initially" "0" \
+    "pvesh get /nodes/$HOSTNAME/hardware/gpu/0000:04:00.0/vf --output-format json | python3 -c \"import sys,json; print(len(json.load(sys.stdin)))\""
+run_test_output "BMG max VFs is 24" "24" \
+    "pvesh get /nodes/$HOSTNAME/hardware/gpu/0000:04:00.0/sriov --output-format json | python3 -c \"import sys,json; print(json.load(sys.stdin)['sriov_maxvfs'])\""
+run_test_output "Read-only smoke leaves sysfs numvfs=0" "0" \
+    "cat /tmp/fake-gpu/sys/bus/pci/devices/0000:04:00.0/sriov_numvfs"
 
 echo ""
 echo "--- Fake sysfs integrity ---"
-run_test_output "Fake vendor" "0x8086" "cat /tmp/fake-gpu/sys/bus/pci/devices/0000:03:00.0/vendor"
-run_test_output "Fake device" "0x56c0" "cat /tmp/fake-gpu/sys/bus/pci/devices/0000:03:00.0/device"
-run_test_output "Fake temp" "42000" "cat /tmp/fake-gpu/sys/class/drm/card0/device/hwmon/hwmon0/temp1_input"
+run_test_output "Fake BMG vendor" "0x8086" "cat /tmp/fake-gpu/sys/bus/pci/devices/0000:04:00.0/vendor"
+run_test_output "Fake BMG device" "0xe211" "cat /tmp/fake-gpu/sys/bus/pci/devices/0000:04:00.0/device"
+run_test_output "Fake BMG temp" "43000" "cat /tmp/fake-gpu/sys/class/drm/card1/device/hwmon/hwmon1/temp1_input"
+run_test_output "Fake BMG scheduler" "low" \
+    "cat /tmp/fake-gpu/sys/bus/pci/devices/0000:04:00.0/sriov_admin/pf/profile/sched_priority"
 
 echo ""
 echo "--- Uninstall test ---"

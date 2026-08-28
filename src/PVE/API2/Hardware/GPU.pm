@@ -22,6 +22,7 @@ use PVE::GPU::SRIOV qw(
     active_sched_priority
     decode_vf_profiles
     effective_max_vfs
+    normalise_resource_profile
     untaint_sysfs_write_path
     validate_vf_profiles
 );
@@ -44,7 +45,6 @@ sub get_vendor_plugin {
 
 # Load vendor plugins (they register themselves on use)
 use PVE::API2::Hardware::GPU::Intel;
-use PVE::API2::Hardware::GPU::Nvidia;
 
 # BDF format regex
 my $BDF_RE = '[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]';
@@ -337,6 +337,12 @@ sub write_ini_config {
         die $error;
     }
     return 1;
+}
+
+sub _persistent_device_enabled {
+    my ($config, $bdf) = @_;
+    return ref($config->{$bdf}) eq 'HASH' &&
+        ($config->{$bdf}{persist} // '') eq '1';
 }
 
 # ---------------------------------------------------------------------------
@@ -660,7 +666,7 @@ sub _collect_device {
 
     # Check persistence
     my $persist_config = parse_ini_config($GPU_SRIOV_CONF);
-    my $persisted = (exists $persist_config->{$bdf}) ? \1 : \0;
+    my $persisted = _persistent_device_enabled($persist_config, $bdf) ? \1 : \0;
 
     my $sriov_capable = _has_sriov_cap($bdf) ? \1 : \0;
 
@@ -794,11 +800,9 @@ sub _read_scheduler_priority {
         $rec->{bdf},
         "scheduler VF count for $rec->{bdf}",
     );
-    return undef if $count < 1;
-
     my %priorities;
-    for my $vf (1 .. $count) {
-        my $priority = $plugin->read_scheduler_priority($rec->{bdf}, $vf);
+    for my $function (0 .. $count) {
+        my $priority = $plugin->read_scheduler_priority($rec->{bdf}, $function);
         return undef if !defined($priority);
         $priorities{$priority} = 1;
     }
@@ -847,7 +851,9 @@ sub _read_vf_resources {
     my ($rec, $vf_index, $persist_config) = @_;
     my $paths = _resource_paths_for_vf($rec, $vf_index);
     my $section = "$rec->{bdf}/vf$vf_index";
-    my $persisted = $persist_config->{$section} // {};
+    my $persisted = _persistent_device_enabled($persist_config, $rec->{bdf})
+        ? ($persist_config->{$section} // {})
+        : {};
     my %resources;
 
     for my $name (@VF_RESOURCE_NAMES) {
@@ -910,7 +916,7 @@ sub _snapshot_state {
     }
 
     my $scheduler = _read_scheduler_priority($rec);
-    if ($count > 0 && $rec->{family} =~ /^bmg(?:_12vf)?$/ &&
+    if ($rec->{family} =~ /^bmg(?:_12vf)?$/ &&
         (!defined($scheduler) || $scheduler eq 'mixed')) {
         die "Cannot snapshot a consistent BMG scheduler profile for $rec->{bdf}\n";
     }
@@ -1022,6 +1028,59 @@ sub _persisted_vf_driver {
     my $section = "$pf_bdf/vf$vf_index";
     return undef if !exists($config->{$pf_bdf}) || !exists($config->{$section});
     return $config->{$section}{driver} // '';
+}
+
+sub _validated_persisted_vf_driver {
+    my ($rec, $vf_index) = @_;
+    my $pf_bdf = $rec->{bdf};
+    my $config = parse_ini_config($GPU_SRIOV_CONF, 1);
+    my $device = $config->{$pf_bdf};
+
+    die "VF assignment requires a persistent SR-IOV profile for $pf_bdf\n"
+        if ref($device) ne 'HASH' || ($device->{persist} // '') ne '1';
+    die "VF assignment requires an api_version=2 SR-IOV profile for $pf_bdf\n"
+        if ($device->{api_version} // '') ne '2';
+    my $configured_count = $device->{num_vfs};
+    die "Persistent SR-IOV profile for $pf_bdf does not match the live VF topology\n"
+        if !defined($configured_count) || $configured_count !~ /^\d+$/ ||
+           int($configured_count) != int($rec->{sriov_numvfs});
+    die "Persistent SR-IOV profile for $pf_bdf has an invalid drivers_autoprobe value\n"
+        if ($device->{drivers_autoprobe} // '') !~ /^(?:0|1)$/;
+    my $scheduler = $device->{sched_priority} // 'low';
+    my $unsafe_scheduler = $device->{allow_unsafe_scheduler} // '0';
+    die "Persistent SR-IOV profile for $pf_bdf has an invalid scheduler policy\n"
+        if $scheduler !~ /^(?:low|normal)$/ || $unsafe_scheduler !~ /^(?:0|1)$/ ||
+           ($scheduler eq 'normal' && $unsafe_scheduler ne '1');
+    die "Persistent SR-IOV profile for $pf_bdf does not match the supported BMG family\n"
+        if ($device->{family} // '') ne $rec->{family};
+    if (defined($device->{device_id}) && $device->{device_id} ne '') {
+        my $configured_device = lc($device->{device_id});
+        $configured_device = "0x$configured_device"
+            if $configured_device !~ /^0x/;
+        die "Persistent SR-IOV profile for $pf_bdf does not match the live PCI device\n"
+            if $configured_device ne $rec->{device_id};
+    }
+
+    my $target_driver;
+    for my $profile_index (1 .. int($configured_count)) {
+        my $profile = $config->{"$pf_bdf/vf$profile_index"};
+        die "Persistent SR-IOV profile for $pf_bdf is missing VF$profile_index\n"
+            if ref($profile) ne 'HASH';
+        for my $name (@VF_RESOURCE_NAMES) {
+            my $mode = $profile->{"${name}_mode"};
+            die "Persistent VF$profile_index resource '$name' mode must be auto or custom\n"
+                if !defined($mode) || $mode !~ /^(?:auto|custom)$/;
+            my $resource = { mode => $mode };
+            $resource->{quota} = $profile->{"${name}_quota"} if $mode eq 'custom';
+            normalise_resource_profile($name, $resource);
+        }
+
+        my $driver = $profile->{driver} // '';
+        die "Persistent VF$profile_index has unsupported driver '$driver'\n"
+            if $driver !~ /^(?:|vfio-pci|xe)$/;
+        $target_driver = $driver if $profile_index == $vf_index;
+    }
+    return $target_driver;
 }
 
 sub _set_persisted_vf_driver {
@@ -1238,10 +1297,24 @@ sub _set_vf_assignment {
                 my $normal_override = $current_override eq '(null)' ? '' : $current_override;
                 my $driver_needs_change =
                     $current_driver ne $desired_driver || $normal_override ne '';
-                my $persisted_driver = _persisted_vf_driver($rec->{bdf}, $vf_index);
-                die "Cannot persist VF $vf_index assignment because the SR-IOV PF/VF profile is incomplete; save the VF profile first\n"
-                    if !defined($persisted_driver);
+                my ($persisted_driver, $persistence_profile_valid);
+                if ($target_vmid) {
+                    $persisted_driver = _validated_persisted_vf_driver(
+                        $rec,
+                        $vf_index,
+                    );
+                    $persistence_profile_valid = 1;
+                } else {
+                    $persistence_profile_valid = eval {
+                        $persisted_driver = _validated_persisted_vf_driver(
+                            $rec,
+                            $vf_index,
+                        );
+                        1;
+                    } ? 1 : 0;
+                }
                 my $persistence_needs_change =
+                    $persistence_profile_valid &&
                     $persisted_driver ne $desired_driver;
                 my $original_autoprobe = _read_uint_sysfs(
                     "/sys/bus/pci/devices/$rec->{bdf}/sriov_drivers_autoprobe",
@@ -1313,8 +1386,8 @@ sub _set_vf_assignment {
                             $vf_index,
                             $desired_driver,
                         );
-                        my $actual_persisted = _persisted_vf_driver(
-                            $rec->{bdf},
+                        my $actual_persisted = _validated_persisted_vf_driver(
+                            $rec,
                             $vf_index,
                         );
                         die "Persisted VF driver verification failed\n"
@@ -1551,9 +1624,7 @@ sub _scheduler_for_transaction {
     my ($requested, $topology_changed, $snapshot, $target) = @_;
     my $effective = $requested;
     if ($topology_changed && $requested eq 'unchanged') {
-        $effective = $snapshot->{count} > 0
-            ? $snapshot->{scheduler}
-            : 'low';
+        $effective = $snapshot->{scheduler};
         die "Cannot preserve an unreadable or mixed scheduler during VF reprovision\n"
             if !defined($effective) || $effective eq 'mixed';
     }
@@ -1673,7 +1744,7 @@ sub _rollback_state {
         push @errors, "resource rollback $restore->{path}: $@" if $@;
     }
 
-    if (defined($snapshot->{scheduler}) && $snapshot->{count} > 0) {
+    if (defined($snapshot->{scheduler})) {
         eval { _set_scheduler_priority($rec, $snapshot->{scheduler}) };
         push @errors, "scheduler rollback: $@" if $@;
     }
@@ -1726,7 +1797,9 @@ sub _persist_profiles {
     # (notably the acknowledgement carried by an unchanged normal profile).
     $requested_scheduler = $scheduler if !defined($requested_scheduler);
     my $config = parse_ini_config($GPU_SRIOV_CONF, 1);
-    my $previous = $config->{$rec->{bdf}} // {};
+    my $previous = _persistent_device_enabled($config, $rec->{bdf})
+        ? $config->{$rec->{bdf}}
+        : {};
     _remove_persisted_device($config, $rec->{bdf});
 
     if ($persist) {
@@ -1767,7 +1840,10 @@ sub _persist_profiles {
                     if $resource->{mode} eq 'custom';
             }
             my $vf_bdf = _vf_bdf($rec->{bdf}, $vf);
-            $section{driver} = defined($vf_bdf) ? _pci_driver($vf_bdf) : '';
+            my $driver = defined($vf_bdf) ? _pci_driver($vf_bdf) : '';
+            die "Cannot persist unsupported BMG VF$vf driver '$driver'\n"
+                if $driver !~ /^(?:|vfio-pci|xe)$/;
+            $section{driver} = $driver;
             $config->{"$rec->{bdf}/vf$vf"} = \%section;
         }
     }
@@ -1801,10 +1877,12 @@ sub _legacy_profiles {
 
 sub _profiles_require_auto_reprovision {
     my ($rec, $profiles, $persist_config) = @_;
+    my $persisted = _persistent_device_enabled($persist_config, $rec->{bdf});
     for my $profile (@$profiles) {
         my $section = $persist_config->{"$rec->{bdf}/vf$profile->{vf_index}"} // {};
         for my $name (@VF_RESOURCE_NAMES) {
             next if $profile->{resources}{$name}{mode} ne 'auto';
+            return 1 if !$persisted;
             return 1 if ($section->{"${name}_mode"} // '') ne 'auto';
         }
     }
@@ -1859,21 +1937,37 @@ sub _calculate_persistence_drift {
     die "Cannot use an invalid non-negative integer for VF count of $bdf\n"
         if !defined($current_count) || $current_count !~ /^\d+$/;
     $current_count = int($current_count);
-    my $has_device = exists($persist_config->{$bdf});
+    my $has_section = exists($persist_config->{$bdf});
+    my $has_device = _persistent_device_enabled($persist_config, $bdf);
     my $persisted = $persist_config->{$bdf} // {};
     my @profile_sections = grep { /^\Q$bdf\E\/vf\d+$/ } keys %$persist_config;
     my @issues;
     my @resource_drift;
 
-    push @issues, 'live VFs have no persistent device section'
+    push @issues, 'persistent device section is disabled'
+        if $has_section && !$has_device;
+    push @issues, 'live VFs have no enabled persistent device section'
         if $current_count > 0 && !$has_device;
-    push @issues, 'VF profile sections exist without a persistent device section'
+    push @issues, 'VF profile sections exist without an enabled persistent device section'
         if !$has_device && @profile_sections;
     push @issues, 'persistent configuration exists while no live VFs exist'
         if $current_count == 0 && ($has_device || @profile_sections);
 
     my $count_drift = 0;
     if ($has_device) {
+        push @issues, 'persistent api_version is missing or unsupported'
+            if ($persisted->{api_version} // '') ne '2';
+        push @issues, 'persistent drivers_autoprobe is missing or invalid'
+            if ($persisted->{drivers_autoprobe} // '') !~ /^(?:0|1)$/;
+        push @issues, 'persistent device family does not match the live BMG device'
+            if ($persisted->{family} // '') ne $rec->{family};
+        if (defined($persisted->{device_id}) && $persisted->{device_id} ne '') {
+            my $configured_device = lc($persisted->{device_id});
+            $configured_device = "0x$configured_device"
+                if $configured_device !~ /^0x/;
+            push @issues, 'persistent PCI device ID does not match the live device'
+                if $configured_device ne $rec->{device_id};
+        }
         if (!defined($persisted->{num_vfs}) || $persisted->{num_vfs} !~ /^\d+$/) {
             $count_drift = 1;
             push @issues, 'persistent num_vfs is missing or invalid';
@@ -1887,6 +1981,11 @@ sub _calculate_persistence_drift {
     my $scheduler_unreadable = 0;
     my $scheduler_drift = 0;
     if ($has_device && $current_count > 0) {
+        my $unsafe_scheduler = $persisted->{allow_unsafe_scheduler} // '0';
+        if ($unsafe_scheduler !~ /^(?:0|1)$/) {
+            $scheduler_drift = 1;
+            push @issues, 'persistent unsafe scheduler acknowledgement is invalid';
+        }
         if (!defined($persisted->{sched_priority}) ||
             $persisted->{sched_priority} !~ /^(?:low|normal)$/) {
             $scheduler_drift = 1;
@@ -1895,13 +1994,13 @@ sub _calculate_persistence_drift {
             $scheduler_drift = 1;
             $scheduler_unreadable = 1;
             push @issues, defined($scheduler)
-                ? 'live scheduler profiles are mixed across VFs'
+                ? 'live scheduler profiles are mixed across PF/VFs'
                 : 'live scheduler profile is unreadable';
         } elsif ($persisted->{sched_priority} ne $scheduler) {
             $scheduler_drift = 1;
         }
         if (($persisted->{sched_priority} // '') eq 'normal' &&
-            !($persisted->{allow_unsafe_scheduler} // 0)) {
+            $unsafe_scheduler ne '1') {
             $scheduler_drift = 1;
             push @issues, 'persistent normal scheduler lacks the required unsafe acknowledgement';
         }
@@ -1914,6 +2013,14 @@ sub _calculate_persistence_drift {
         if (!$has_device || ref($section) ne 'HASH') {
             push @issues, "persistent profile for VF$vf is missing" if $has_device;
             next;
+        }
+        my $driver = $section->{driver} // '';
+        if ($driver !~ /^(?:|vfio-pci|xe)$/) {
+            push @issues, "persistent driver for VF$vf is unsupported ('$driver')";
+        } else {
+            my $live_driver = $live_by_vf{$vf}{driver} // '';
+            push @issues, "live driver for VF$vf differs from the persistent profile"
+                if $live_driver ne $driver;
         }
         for my $name (@VF_RESOURCE_NAMES) {
             my $mode = $section->{"${name}_mode"};
@@ -1929,11 +2036,18 @@ sub _calculate_persistence_drift {
             }
             next if $mode eq 'auto';
             my $wanted = $section->{"${name}_quota"};
-            if (!defined($wanted) || $wanted !~ /^\d+$/) {
+            my $valid_quota = eval {
+                normalise_resource_profile($name, {
+                    mode => 'custom',
+                    quota => $wanted,
+                });
+                1;
+            };
+            if (!$valid_quota) {
                 push @resource_drift, {
                     vf_index => $vf,
                     resource => $name,
-                    expected => 'numeric custom quota',
+                    expected => 'valid custom quota',
                     actual => $wanted,
                     reason => 'persistent custom quota is missing or invalid',
                 };
@@ -2054,6 +2168,9 @@ sub _configure_sriov_v2 {
                 die "VM PCI configuration changed while locks were acquired; retry the request: " .
                     _format_consumers(\@unlocked) . "\n"
                     if @unlocked;
+                die "Cannot disable SR-IOV persistence while PF/VF PCI assignments exist: " .
+                    _format_consumers($consumers) . "\n"
+                    if !$persist && @$consumers;
                 if ($topology_changed && @$consumers) {
                     die "Cannot rebuild VF topology while PCI functions are configured on VM(s): " .
                         _format_consumers($consumers) . ". Detach them first.\n";

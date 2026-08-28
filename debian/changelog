@@ -1,3 +1,14 @@
+pve-gpu-manager (1.1.0-4) stable; urgency=medium
+
+  * Keep multi-GPU UI requests scoped to the selected PCI device
+  * Require boot-restorable VF profiles and preserve rescue unassignment
+  * Verify scheduler state across the PF and every VF
+  * Migrate legacy persistence and remove obsolete global VFIO and GRUB policy
+  * Reload PVE API daemons after package upgrades
+  * Limit device discovery to validated Intel Battlemage IDs
+
+ -- PVE GPU Manager <pve-gpu@localhost>  Fri, 28 Aug 2026 18:00:00 +0800
+
 pve-gpu-manager (1.1.0-3) stable; urgency=medium
 
   * Add transactional VF assignment, movement, and removal for stopped QEMU VMs

@@ -3,6 +3,7 @@ use strict;
 use warnings;
 use Test::More;
 use File::Basename qw(dirname);
+use File::Path qw(make_path);
 use File::Spec;
 use File::Temp qw(tempdir);
 
@@ -99,6 +100,229 @@ __PACKAGE__->register_method({
     },
 });
 CURRENT_PVE
+
+{
+    my $tmp = tempdir(CLEANUP => 1);
+    my $index = File::Spec->catfile($tmp, 'index.html.tpl');
+    my $hardware = File::Spec->catfile($tmp, 'Hardware.pm');
+    my $nodes = File::Spec->catfile($tmp, 'Nodes.pm');
+    my $bin = File::Spec->catdir($tmp, 'bin');
+    my $runtime = File::Spec->catdir($tmp, 'systemd-runtime');
+    my $systemctl_log = File::Spec->catfile($tmp, 'systemctl.log');
+    make_path($bin, $runtime);
+    write_file($index, $index_fixture);
+    write_file($hardware, $hardware_fixture);
+    write_file($nodes, $nodes_fixture);
+    write_file(
+        File::Spec->catfile($bin, 'systemctl'),
+        "#!/bin/sh\nprintf '%s\\n' \"\$*\" >> \"\$PVE_GPU_SYSTEMCTL_LOG\"\n",
+    );
+    chmod(0755, File::Spec->catfile($bin, 'systemctl'))
+        or die "Cannot make systemctl shim executable: $!";
+
+    ok(run_patch_script($index, $hardware, $nodes, '--apply'),
+        'restart fixture is patched once before the package-only upgrade simulation');
+
+    {
+        local %ENV = %ENV;
+        $ENV{PATH} = "$bin:$ENV{PATH}";
+        $ENV{PVE_GPU_INDEX_TPL} = $index;
+        $ENV{PVE_GPU_HARDWARE_PM} = $hardware;
+        $ENV{PVE_GPU_NODES_PM} = $nodes;
+        $ENV{PVE_GPU_SYSTEMD_RUNTIME_DIR} = $runtime;
+        $ENV{PVE_GPU_SYSTEMCTL_LOG} = $systemctl_log;
+        ok(system($patch_script, '--apply', '--force-restart') == 0,
+            'forced upgrade apply succeeds when integration markers are unchanged');
+    }
+    is(slurp($systemctl_log), "restart pvedaemon\nrestart pveproxy\n",
+        'forced upgrade apply restarts both PVE daemons despite unchanged markers');
+
+    write_file($systemctl_log, '');
+    {
+        local %ENV = %ENV;
+        $ENV{PATH} = "$bin:$ENV{PATH}";
+        $ENV{PVE_GPU_INDEX_TPL} = $index;
+        $ENV{PVE_GPU_HARDWARE_PM} = $hardware;
+        $ENV{PVE_GPU_NODES_PM} = $nodes;
+        $ENV{PVE_GPU_SYSTEMD_RUNTIME_DIR} = $runtime;
+        $ENV{PVE_GPU_SYSTEMCTL_LOG} = $systemctl_log;
+        ok(system($patch_script, '--apply', '--force-restart', '--no-restart') == 0,
+            'explicit no-restart apply succeeds');
+    }
+    is(slurp($systemctl_log), '',
+        'explicit --no-restart overrides the package-upgrade force flag');
+}
+
+{
+    my $tmp = tempdir(CLEANUP => 1);
+    my $bin = File::Spec->catdir($tmp, 'bin');
+    my $state = File::Spec->catdir($tmp, 'state');
+    my $maint_log = File::Spec->catfile($tmp, 'maint.log');
+    my $patch = File::Spec->catfile($tmp, 'reapply-patches.sh');
+    my $sriov = File::Spec->catfile($tmp, 'apply-sriov-config.sh');
+    my $grub = File::Spec->catfile($state, 'grub');
+    my $legacy_modprobe = File::Spec->catfile($state, 'pve-gpu-vfio.modprobe');
+    my $legacy_modules = File::Spec->catfile($state, 'pve-gpu-vfio.modules');
+    make_path($bin, $state);
+
+    for my $command (qw(update-grub update-initramfs systemctl)) {
+        my $path = File::Spec->catfile($bin, $command);
+        write_file(
+            $path,
+            "#!/bin/sh\nprintf '$command %s\\n' \"\$*\" >> \"\$PVE_GPU_MAINT_LOG\"\n",
+        );
+        chmod(0755, $path) or die "Cannot make $path executable: $!";
+    }
+    write_file(
+        $patch,
+        "#!/bin/sh\nprintf 'patch %s\\n' \"\$*\" >> \"\$PVE_GPU_MAINT_LOG\"\n",
+    );
+    write_file(
+        $sriov,
+        "#!/bin/sh\nprintf 'sriov %s\\n' \"\$*\" >> \"\$PVE_GPU_MAINT_LOG\"\n",
+    );
+    chmod(0755, $patch, $sriov) or die "Cannot make maintainer-script shims executable: $!";
+
+    my $postinst = File::Spec->catfile($root, 'debian', 'postinst');
+    my $owned_grub = <<'GRUB';
+GRUB_CMDLINE_LINUX_DEFAULT="quiet intel_iommu=on iommu=pt vfio-pci.ids=8086:e212"
+GRUB_CMDLINE_LINUX="vfio-pci.ids=10de:1abc"
+GRUB
+    write_file($grub, $owned_grub);
+
+    my $run_postinst = sub {
+        my (@arguments) = @_;
+        local %ENV = %ENV;
+        $ENV{PATH} = "$bin:/usr/bin:/bin";
+        $ENV{PVE_GPU_PATCH_SCRIPT} = $patch;
+        $ENV{PVE_GPU_SRIOV_SCRIPT} = $sriov;
+        $ENV{PVE_GPU_LEGACY_MODPROBE_CONF} = $legacy_modprobe;
+        $ENV{PVE_GPU_LEGACY_MODULES_CONF} = $legacy_modules;
+        $ENV{PVE_GPU_GRUB_DEFAULT} = $grub;
+        $ENV{PVE_GPU_MAINT_LOG} = $maint_log;
+        return system('/bin/sh', $postinst, @arguments) == 0;
+    };
+
+    ok($run_postinst->('configure', '1.1.0-3'),
+        'upgrade from an affected package version cleans its orphaned GRUB policy');
+    my $cleaned_grub = slurp($grub);
+    unlike($cleaned_grub, qr/^GRUB_CMDLINE_LINUX_DEFAULT=.*vfio-pci\.ids=/m,
+        'affected upgrade removes the package-owned vfio-pci.ids argument without legacy files');
+    like($cleaned_grub, qr/^GRUB_CMDLINE_LINUX="vfio-pci\.ids=10de:1abc"$/m,
+        'cleanup leaves an independent GRUB_CMDLINE_LINUX VFIO policy unchanged');
+    like(slurp($maint_log), qr/^update-grub\s*$/m,
+        'affected upgrade regenerates GRUB after removing the package-owned argument');
+    unlike(slurp($maint_log), qr/^update-initramfs/m,
+        'GRUB-only legacy cleanup does not rebuild initramfs');
+    like(slurp($maint_log), qr/^patch --apply --force-restart$/m,
+        'affected upgrade still uses forced PVE daemon restart semantics');
+
+    write_file($maint_log, '');
+    ok($run_postinst->('configure', '1.1.0-3'),
+        'repeating the affected upgrade cleanup succeeds');
+    unlike(slurp($maint_log), qr/^update-grub/m,
+        'repeated cleanup does not regenerate an already-clean GRUB configuration');
+    is(slurp($grub), $cleaned_grub,
+        'repeated package-owned GRUB cleanup is byte-for-byte idempotent');
+
+    write_file($maint_log, '');
+    write_file($grub, $owned_grub);
+    ok($run_postinst->('configure'), 'fresh install lifecycle succeeds with an existing user GRUB policy');
+    is(slurp($grub), $owned_grub,
+        'fresh install does not claim or remove an independent vfio-pci.ids configuration');
+    unlike(slurp($maint_log), qr/^update-grub/m,
+        'fresh install does not regenerate unchanged user GRUB configuration');
+
+    write_file($maint_log, '');
+    write_file($grub, <<'USER_GRUB');
+GRUB_CMDLINE_LINUX_DEFAULT="quiet intel_iommu=on iommu=pt vfio-pci.ids=10de:1abc"
+USER_GRUB
+    ok($run_postinst->('configure', '1.1.0-3'),
+        'affected-version upgrade accepts a non-package VFIO policy');
+    like(slurp($grub), qr/vfio-pci\.ids=10de:1abc/,
+        'affected-version cleanup does not remove non-Intel user VFIO IDs');
+}
+
+{
+    my $tmp = tempdir(CLEANUP => 1);
+    my $bin = File::Spec->catdir($tmp, 'bin');
+    my $state = File::Spec->catdir($tmp, 'state');
+    my $maint_log = File::Spec->catfile($tmp, 'maint.log');
+    make_path($bin, $state);
+    for my $command (qw(update-grub update-initramfs systemctl)) {
+        my $path = File::Spec->catfile($bin, $command);
+        write_file(
+            $path,
+            "#!/bin/sh\nprintf '$command %s\\n' \"\$*\" >> \"\$PVE_GPU_MAINT_LOG\"\n",
+        );
+        chmod(0755, $path) or die "Cannot make $path executable: $!";
+    }
+
+    my %paths = (
+        sriov => File::Spec->catfile($state, 'gpu-sriov.conf'),
+        template => File::Spec->catfile($state, 'gpu-vf-templates.conf'),
+        modprobe => File::Spec->catfile($state, 'pve-gpu-vfio.modprobe'),
+        modules => File::Spec->catfile($state, 'pve-gpu-vfio.modules'),
+        vfio => File::Spec->catfile($state, 'pve-gpu-vfio.conf'),
+        sysfs => File::Spec->catfile($state, 'pve-gpu-sysfs-root'),
+        grub => File::Spec->catfile($state, 'grub'),
+        index_backup => File::Spec->catfile($state, 'index.pre-gpu'),
+        hardware_backup => File::Spec->catfile($state, 'Hardware.pm.pre-gpu'),
+        nodes_backup => File::Spec->catfile($state, 'Nodes.pm.pre-gpu'),
+    );
+    write_file($_, "managed\n") for @paths{qw(sriov template modprobe modules vfio sysfs index_backup hardware_backup nodes_backup)};
+    write_file($paths{grub}, <<'PURGE_GRUB');
+GRUB_CMDLINE_LINUX_DEFAULT="quiet intel_iommu=on iommu=pt vfio-pci.ids=8086:e212"
+GRUB_CMDLINE_LINUX="vfio-pci.ids=10de:1abc"
+PURGE_GRUB
+
+    my $postrm = File::Spec->catfile($root, 'debian', 'postrm');
+    my $run_postrm = sub {
+        local %ENV = %ENV;
+        $ENV{PATH} = "$bin:/usr/bin:/bin";
+        $ENV{PVE_GPU_SRIOV_CONF} = $paths{sriov};
+        $ENV{PVE_GPU_TEMPLATE_CONF} = $paths{template};
+        $ENV{PVE_GPU_LEGACY_MODPROBE_CONF} = $paths{modprobe};
+        $ENV{PVE_GPU_LEGACY_MODULES_CONF} = $paths{modules};
+        $ENV{PVE_GPU_VFIO_CONF} = $paths{vfio};
+        $ENV{PVE_GPU_SYSFS_ROOT_CONF} = $paths{sysfs};
+        $ENV{PVE_GPU_GRUB_DEFAULT} = $paths{grub};
+        $ENV{PVE_GPU_INDEX_BACKUP} = $paths{index_backup};
+        $ENV{PVE_GPU_HARDWARE_BACKUP} = $paths{hardware_backup};
+        $ENV{PVE_GPU_NODES_BACKUP} = $paths{nodes_backup};
+        $ENV{PVE_GPU_MAINT_LOG} = $maint_log;
+        return system('/bin/sh', $postrm, 'purge') == 0;
+    };
+
+    ok($run_postrm->(), 'purge lifecycle removes package-owned legacy policy');
+    my @managed_paths = @paths{qw(sriov template modprobe modules vfio sysfs index_backup hardware_backup nodes_backup)};
+    ok(!grep({ -e $_ } @managed_paths),
+        'purge removes every package-managed configuration and stale backup fixture');
+    unlike(slurp($paths{grub}), qr/^GRUB_CMDLINE_LINUX_DEFAULT=.*vfio-pci\.ids=/m,
+        'purge removes package-owned legacy GRUB VFIO IDs');
+    like(slurp($paths{grub}), qr/^GRUB_CMDLINE_LINUX="vfio-pci\.ids=10de:1abc"$/m,
+        'purge preserves an independent GRUB_CMDLINE_LINUX VFIO policy');
+    like(slurp($maint_log), qr/^update-grub\s*$/m,
+        'purge regenerates GRUB after owned-policy removal');
+    like(slurp($maint_log), qr/^update-initramfs -u$/m,
+        'purge rebuilds initramfs after legacy files are removed');
+
+    my $purged_grub = slurp($paths{grub});
+    write_file($maint_log, '');
+    ok($run_postrm->(), 'repeated purge lifecycle succeeds');
+    is(slurp($paths{grub}), $purged_grub,
+        'repeated purge leaves the GRUB configuration unchanged');
+    unlike(slurp($maint_log), qr/^update-(?:grub|initramfs)/m,
+        'repeated purge performs no legacy boot-policy regeneration');
+
+    write_file($paths{grub}, <<'UNOWNED_GRUB');
+GRUB_CMDLINE_LINUX_DEFAULT="quiet intel_iommu=on iommu=pt vfio-pci.ids=8086:e212"
+UNOWNED_GRUB
+    write_file($maint_log, '');
+    ok($run_postrm->(), 'purge without a package ownership marker succeeds');
+    like(slurp($paths{grub}), qr/vfio-pci\.ids=8086:e212/,
+        'purge does not remove an unowned GRUB VFIO argument when legacy files are absent');
+}
 
 ok(-x $patch_script, 'marker patch script is executable');
 
@@ -203,7 +427,6 @@ ok(-x $patch_script, 'marker patch script is executable');
     for my $source (
         'src/PVE/API2/Hardware/GPU.pm',
         'src/PVE/API2/Hardware/GPU/Intel.pm',
-        'src/PVE/API2/Hardware/GPU/Nvidia.pm',
         'src/PVE/GPU/SRIOV.pm',
         'src/js/pve-gpu-plugin.js',
         'src/scripts/apply-sriov-config.sh',
@@ -215,6 +438,8 @@ ok(-x $patch_script, 'marker patch script is executable');
     ) {
         like($makefile, qr/\Q$source\E/, "install manifest contains $source");
     }
+    unlike($makefile, qr{GPU/Nvidia\.pm},
+        'install manifest does not ship an unregistered Nvidia backend');
     unlike($makefile, qr{rm -f \.\./\*\.deb}, 'clean does not delete every sibling deb');
 
     my $rules = slurp(File::Spec->catfile($root, 'debian', 'rules'));
@@ -229,6 +454,20 @@ ok(-x $patch_script, 'marker patch script is executable');
 
     my $postinst = slurp(File::Spec->catfile($root, 'debian', 'postinst'));
     like($postinst, qr/"\$PATCH_SCRIPT" --apply/, 'postinst delegates marker application');
+    like($postinst, qr/"\$SRIOV_SCRIPT" --migrate-only/,
+        'postinst migrates legacy SR-IOV persistence before enabling boot restore');
+    like($postinst, qr/\[ -n "\$\{2:-\}" \].*?--force-restart/s,
+        'postinst forces daemon restart specifically on configured-package upgrades');
+    like($postinst, qr{/etc/modprobe\.d/pve-gpu-vfio\.conf},
+        'postinst removes the legacy global driver blacklist');
+    like($postinst, qr{/etc/modules-load\.d/pve-gpu-vfio\.conf},
+        'postinst removes the legacy global VFIO modules-load policy');
+    like($postinst, qr{vfio-pci\\?\.ids=.*?update-grub}s,
+        'postinst removes the legacy vfio-pci.ids kernel argument and refreshes GRUB');
+    like($postinst, qr/1\.0\.0-1\|1\.1\.0-1\|1\.1\.0-2\|1\.1\.0-3/,
+        'postinst scopes orphaned GRUB ownership to package versions that can carry the old policy');
+    like($postinst, qr/update-initramfs -u/,
+        'postinst refreshes initramfs when legacy boot policy was removed');
     unlike($postinst, qr/\.pre-gpu|patch_index_html|patch_hardware_pm/,
         'postinst has no whole-file backup or duplicate patch implementation');
     like($postinst, qr/systemctl enable pve-gpu-vfio\.service/,
@@ -249,8 +488,10 @@ ok(-x $patch_script, 'marker patch script is executable');
         'ordinary removal retains user configuration');
 
     my $postrm = slurp(File::Spec->catfile($root, 'debian', 'postrm'));
-    like($postrm, qr/purge\).*?rm -f \/etc\/pve\/local\/gpu-sriov\.conf/s,
+    like($postrm, qr/purge\).*?rm -f "\$SRIOV_CONF"/s,
         'purge removes generated SR-IOV configuration');
+    like($postrm, qr/purge\).*?vfio-pci\\?\.ids=.*?update-grub/s,
+        'purge also removes a package-owned legacy vfio-pci.ids argument');
 
     my $e2e = slurp(File::Spec->catfile($root, 'scripts', 'e2e.sh'));
     unlike($e2e, qr/playwright test[^\n]*\) \|\| true/,
@@ -277,8 +518,8 @@ ok(-x $patch_script, 'marker patch script is executable');
         'boot restore rolls back previously applied PFs after a later PF fails');
     like($boot_restore, qr/APPLIED_DEVICES/,
         'boot restore tracks successfully applied PFs for rollback');
-    like($boot_restore, qr/Current scheduler profile is inconsistent across VFs/,
-        'boot rollback snapshot requires one consistent all-VF scheduler');
+    like($boot_restore, qr/Current scheduler profile is inconsistent across PF\/VFs/,
+        'boot rollback snapshot requires one consistent PF and all-VF scheduler');
 
     ok(!-e File::Spec->catfile($root, 'debian', 'pve-xpu-manager.postrm.debhelper'),
         'stale pve-xpu-manager postrm helper is absent');

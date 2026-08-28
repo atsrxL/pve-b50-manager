@@ -11,6 +11,8 @@ INDEX_TPL="${PVE_GPU_INDEX_TPL:-/usr/share/pve-manager/index.html.tpl}"
 HARDWARE_PM="${PVE_GPU_HARDWARE_PM:-/usr/share/perl5/PVE/API2/Hardware.pm}"
 NODES_PM="${PVE_GPU_NODES_PM:-/usr/share/perl5/PVE/API2/Nodes.pm}"
 NO_RESTART="${PVE_GPU_NO_RESTART:-0}"
+FORCE_RESTART="${PVE_GPU_FORCE_RESTART:-0}"
+SYSTEMD_RUNTIME_DIR="${PVE_GPU_SYSTEMD_RUNTIME_DIR:-/run/systemd/system}"
 
 INDEX_BEGIN='<!-- BEGIN PVE GPU MANAGER -->'
 INDEX_END='<!-- END PVE GPU MANAGER -->'
@@ -297,10 +299,10 @@ remove_legacy_nodes() {
 }
 
 restart_pve_services() {
-    [ "$CHANGED" -eq 1 ] || return 0
     [ "$NO_RESTART" = 1 ] && return 0
+    [ "$CHANGED" -eq 1 ] || [ "$FORCE_RESTART" = 1 ] || return 0
     command -v systemctl >/dev/null 2>&1 || return 0
-    [ -d /run/systemd/system ] || return 0
+    [ -d "$SYSTEMD_RUNTIME_DIR" ] || return 0
 
     systemctl restart pvedaemon \
         || log "WARNING: Failed to restart pvedaemon"
@@ -324,16 +326,31 @@ remove_all() {
     log "Marker integration is absent"
 }
 
-case "${1:---apply}" in
+ACTION=--apply
+for argument in "$@"; do
+    case "$argument" in
+        --apply|--remove)
+            ACTION="$argument"
+            ;;
+        --force-restart)
+            FORCE_RESTART=1
+            ;;
+        --no-restart)
+            NO_RESTART=1
+            ;;
+        *)
+            echo "Usage: $0 [--apply|--remove] [--force-restart] [--no-restart]" >&2
+            exit 2
+            ;;
+    esac
+done
+
+case "$ACTION" in
     --apply)
         apply_all
         ;;
     --remove)
         remove_all
-        ;;
-    *)
-        echo "Usage: $0 [--apply|--remove]" >&2
-        exit 2
         ;;
 esac
 

@@ -38,6 +38,8 @@ STATE_SNAPSHOTTED=0
 OLD_COUNT=0
 OLD_AUTOPROBE=0
 OLD_SCHEDULER=""
+MIGRATION_TEMP=""
+MIGRATE_ONLY=0
 
 log() {
     printf '%s\n' "$*"
@@ -131,6 +133,186 @@ parse_ini() {
     done < "$file"
 }
 
+set_cfg() {
+    local section="$1"
+    local key="$2"
+    local value="$3"
+    SECTIONS["$section"]=1
+    CONFIG["$section|$key"]="$value"
+}
+
+remove_config_section() {
+    local section="$1"
+    local compound
+    for compound in "${!CONFIG[@]}"; do
+        [[ "$compound" == "$section|"* ]] || continue
+        unset "CONFIG[$compound]"
+    done
+    unset "SECTIONS[$section]"
+}
+
+write_config_atomic() {
+    local section compound key
+    local -a sections=() keys=()
+
+    MIGRATION_TEMP=$(mktemp "${SRIOV_CONF}.migrate.XXXXXX") ||
+        fatal "Cannot create migration file beside '$SRIOV_CONF'"
+    mapfile -t sections < <(printf '%s\n' "${!SECTIONS[@]}" | LC_ALL=C sort)
+    for section in "${sections[@]}"; do
+        printf '[%s]\n' "$section" >> "$MIGRATION_TEMP"
+        keys=()
+        for compound in "${!CONFIG[@]}"; do
+            [[ "$compound" == "$section|"* ]] || continue
+            keys+=("${compound#"$section|"}")
+        done
+        mapfile -t keys < <(printf '%s\n' "${keys[@]}" | LC_ALL=C sort)
+        for key in "${keys[@]}"; do
+            printf '%s = %s\n' "$key" "${CONFIG[$section|$key]}" >> "$MIGRATION_TEMP"
+        done
+        printf '\n' >> "$MIGRATION_TEMP"
+    done
+    mv -f "$MIGRATION_TEMP" "$SRIOV_CONF" ||
+        fatal "Cannot atomically replace '$SRIOV_CONF' after migration"
+    MIGRATION_TEMP=""
+}
+
+legacy_resource_value() {
+    local section="$1"
+    local vf_section="$2"
+    local resource="$3"
+    local pf_key vf_key value
+
+    case "$resource" in
+        vram) pf_key=lmem_per_vf; vf_key=lmem_quota ;;
+        ggtt) pf_key=ggtt_per_vf; vf_key=ggtt_quota ;;
+        contexts) pf_key=contexts_per_vf; vf_key=contexts_quota ;;
+        doorbells) pf_key=doorbells_per_vf; vf_key=doorbells_quota ;;
+        exec_quantum_ms) pf_key=exec_quantum_ms; vf_key=exec_quantum_ms ;;
+        preempt_timeout_us) pf_key=preempt_timeout_us; vf_key=preempt_timeout_us ;;
+        *) return 1 ;;
+    esac
+
+    value=$(cfg "$vf_section" "$vf_key")
+    [[ -n "$value" ]] || value=$(cfg "$section" "$pf_key")
+    [[ -n "$value" ]] || return 1
+    printf '%s' "$value"
+}
+
+family_for_device_id() {
+    case "$1" in
+        e211|e212|e222) printf 'bmg' ;;
+        e223) printf 'bmg_12vf' ;;
+        *) return 1 ;;
+    esac
+}
+
+migrate_legacy_device() {
+    local section="$1"
+    local bdf=${section,,}
+    local pf vendor device device_id family num_vfs autoprobe vf vf_section resource quota driver key child
+    local -a old_children=() old_pf_keys=(
+        lmem_per_vf
+        ggtt_per_vf
+        contexts_per_vf
+        doorbells_per_vf
+        exec_quantum_ms
+        preempt_timeout_us
+        template
+    )
+    local -A migration_values=() migration_drivers=()
+
+    pf=$(pf_path "$bdf")
+    vendor=$(read_value "$pf/vendor") || fatal "Cannot read PCI vendor at exact BDF $bdf for v1 migration"
+    [[ "${vendor,,}" == "0x8086" ]] ||
+        fatal "PCI device at exact BDF $bdf is not Intel; refusing v1 migration"
+    device=$(read_value "$pf/device") || fatal "Cannot read PCI device ID at exact BDF $bdf for v1 migration"
+    device_id=${device,,}
+    device_id=${device_id#0x}
+    [[ "$device_id" =~ ^[[:xdigit:]]{4}$ ]] ||
+        fatal "Invalid PCI device ID '$device' at exact BDF $bdf"
+    family=$(family_for_device_id "$device_id") ||
+        fatal "PCI device 0x$device_id at exact BDF $bdf does not use the supported BMG xe ABI"
+
+    num_vfs=$(cfg "$section" num_vfs)
+    if ! is_safe_uint "$num_vfs" || (( 10#$num_vfs == 0 )); then
+        fatal "Invalid legacy num_vfs '$num_vfs' in [$section]"
+    fi
+    autoprobe=$(cfg "$section" drivers_autoprobe)
+    [[ "$autoprobe" =~ ^[01]$ ]] ||
+        fatal "Invalid legacy drivers_autoprobe '$autoprobe' in [$section]"
+
+    for ((vf = 1; vf <= 10#$num_vfs; vf++)); do
+        vf_section="$section/vf$vf"
+        for resource in "${RESOURCE_NAMES[@]}"; do
+            quota=$(legacy_resource_value "$section" "$vf_section" "$resource") ||
+                fatal "Legacy section [$section] does not contain an explicit '$resource' value for VF$vf"
+            validate_quota "$resource" "$quota" ||
+                fatal "Invalid legacy '$resource' value '$quota' for VF$vf in [$section]"
+            migration_values["$vf|$resource"]="$quota"
+        done
+        driver=""
+        if vf_device_path "$bdf" "$vf" >/dev/null; then
+            driver=$(vf_driver "$bdf" "$vf") ||
+                fatal "Cannot read current VF$vf driver for $bdf during v1 migration"
+        elif [[ "$autoprobe" == "1" ]]; then
+            driver=xe
+        fi
+        [[ -z "$driver" || "$driver" == "vfio-pci" || "$driver" == "xe" ]] ||
+            fatal "Cannot migrate unsupported BMG VF$vf driver '$driver' in [$section]"
+        migration_drivers["$vf"]="$driver"
+    done
+
+    for child in "${!SECTIONS[@]}"; do
+        [[ "$child" == "$section/vf"* ]] || continue
+        old_children+=("$child")
+    done
+    for child in "${old_children[@]}"; do
+        remove_config_section "$child"
+    done
+    for key in "${old_pf_keys[@]}"; do
+        unset "CONFIG[$section|$key]"
+    done
+
+    set_cfg "$section" api_version 2
+    set_cfg "$section" persist 1
+    set_cfg "$section" device_id "0x$device_id"
+    set_cfg "$section" family "$family"
+    set_cfg "$section" num_vfs "$num_vfs"
+    set_cfg "$section" drivers_autoprobe "$autoprobe"
+    set_cfg "$section" sched_priority low
+    set_cfg "$section" allow_unsafe_scheduler 0
+
+    for ((vf = 1; vf <= 10#$num_vfs; vf++)); do
+        vf_section="$section/vf$vf"
+        for resource in "${RESOURCE_NAMES[@]}"; do
+            set_cfg "$vf_section" "${resource}_mode" custom
+            set_cfg "$vf_section" "${resource}_quota" "${migration_values[$vf|$resource]}"
+        done
+        set_cfg "$vf_section" driver "${migration_drivers[$vf]}"
+    done
+}
+
+migrate_legacy_config() {
+    local section api_version changed=0
+    local -a sections=()
+
+    mapfile -t sections < <(printf '%s\n' "${!SECTIONS[@]}" | LC_ALL=C sort)
+    for section in "${sections[@]}"; do
+        [[ "$section" != */* ]] || continue
+        [[ "$section" =~ ^[[:xdigit:]]{4}:[[:xdigit:]]{2}:[[:xdigit:]]{2}\.[0-7]$ ]] || continue
+        [[ "$(cfg "$section" persist 0)" == "1" ]] || continue
+        api_version=$(cfg "$section" api_version)
+        [[ -z "$api_version" ]] || continue
+        migrate_legacy_device "$section"
+        changed=1
+    done
+
+    if (( changed == 1 )); then
+        write_config_atomic
+        log "Migrated legacy SR-IOV configuration to api_version=2"
+    fi
+}
+
 wait_for_path() {
     local full="$1"
     local description="$2"
@@ -197,6 +379,7 @@ wait_for_device_controls() {
     [[ "$driver" == "xe" ]] || fatal "PCI device $bdf is bound to '$driver', expected 'xe'"
     wait_for_path "$debug/restore_auto_provisioning" "xe SR-IOV debugfs ABI for $bdf"
     wait_for_path "$pf/sriov_admin/.bulk_profile/sched_priority" "scheduler control for $bdf"
+    wait_for_path "$pf/sriov_admin/pf/profile/sched_priority" "PF scheduler profile for $bdf"
 }
 
 is_safe_uint() {
@@ -282,7 +465,7 @@ validate_device_config() {
             fi
         done
         driver=$(cfg "$vf_section" driver)
-        [[ -z "$driver" || "$driver" == "vfio-pci" || "$driver" == "xe" || "$driver" == "i915" ]] ||
+        [[ -z "$driver" || "$driver" == "vfio-pci" || "$driver" == "xe" ]] ||
             fatal "Unsupported persisted driver '$driver' in [$vf_section]"
     done
 }
@@ -386,9 +569,16 @@ wait_for_vf_tree() {
 
 active_scheduler() {
     local bdf="$1"
-    local vf="${2:-1}"
-    local raw
-    raw=$(read_value "$(pf_path "$bdf")/sriov_admin/vf$vf/profile/sched_priority") || return 1
+    local function_index="${2:-0}"
+    local function raw
+    if [[ "$function_index" == "0" ]]; then
+        function=pf
+    elif [[ "$function_index" =~ ^[1-9][0-9]*$ ]]; then
+        function="vf$function_index"
+    else
+        return 1
+    fi
+    raw=$(read_value "$(pf_path "$bdf")/sriov_admin/$function/profile/sched_priority") || return 1
     case "$raw" in
         *\[low\]*) printf 'low' ;;
         *\[normal\]*) printf 'normal' ;;
@@ -406,6 +596,8 @@ scheduler_matches() {
     local count="$2"
     local expected="$3"
     local vf actual
+    actual=$(active_scheduler "$bdf" 0) || return 1
+    [[ "$actual" == "$expected" ]] || return 1
     for ((vf = 1; vf <= count; vf++)); do
         actual=$(active_scheduler "$bdf" "$vf") || return 1
         [[ "$actual" == "$expected" ]] || return 1
@@ -419,7 +611,6 @@ apply_scheduler() {
     local attempts=$((WAIT_SECONDS * 10))
     local attempt path
 
-    (( count > 0 )) || return 0
     if scheduler_matches "$bdf" "$count" "$priority"; then
         return 0
     fi
@@ -541,10 +732,10 @@ snapshot_state() {
 
     if (( 10#$OLD_COUNT > 0 )); then
         wait_for_vf_tree "$bdf" "$((10#$OLD_COUNT))"
-        OLD_SCHEDULER=$(active_scheduler "$bdf" 1) || fatal "Cannot read current scheduler for $bdf"
-        scheduler_matches "$bdf" "$((10#$OLD_COUNT))" "$OLD_SCHEDULER" ||
-            fatal "Current scheduler profile is inconsistent across VFs for $bdf"
     fi
+    OLD_SCHEDULER=$(active_scheduler "$bdf" 0) || fatal "Cannot read current PF scheduler for $bdf"
+    scheduler_matches "$bdf" "$((10#$OLD_COUNT))" "$OLD_SCHEDULER" ||
+        fatal "Current scheduler profile is inconsistent across PF/VFs for $bdf"
 
     for ((vf = 1; vf <= 10#$OLD_COUNT; vf++)); do
         driver=$(vf_driver "$bdf" "$vf") || fatal "Cannot snapshot VF$vf driver for $bdf"
@@ -731,10 +922,10 @@ rollback_active_device() {
             (trap - EXIT; set_vf_driver "$bdf" "$vf" "$target") ||
                 log "ROLLBACK ERROR: Cannot restore VF$vf driver '${target:-unbound}'"
         done
-        if [[ "$OLD_SCHEDULER" == "low" || "$OLD_SCHEDULER" == "normal" || "$OLD_SCHEDULER" == "high" ]]; then
-            (trap - EXIT; apply_scheduler "$bdf" "$((10#$OLD_COUNT))" "$OLD_SCHEDULER") ||
-                log "ROLLBACK ERROR: Cannot restore scheduler '$OLD_SCHEDULER'"
-        fi
+    fi
+    if [[ "$OLD_SCHEDULER" == "low" || "$OLD_SCHEDULER" == "normal" || "$OLD_SCHEDULER" == "high" ]]; then
+        (trap - EXIT; apply_scheduler "$bdf" "$((10#$OLD_COUNT))" "$OLD_SCHEDULER") ||
+            log "ROLLBACK ERROR: Cannot restore scheduler '$OLD_SCHEDULER'"
     fi
     printf '%s\n' "$OLD_AUTOPROBE" > "$(root_path "$pf/sriov_drivers_autoprobe")" ||
         log "ROLLBACK ERROR: Cannot restore sriov_drivers_autoprobe"
@@ -762,6 +953,10 @@ rollback_completed_devices() {
 on_exit() {
     local rc=$?
     trap - EXIT
+    if [[ -n "$MIGRATION_TEMP" ]]; then
+        rm -f "$MIGRATION_TEMP"
+        MIGRATION_TEMP=""
+    fi
     if (( rc != 0 )); then
         rollback_active_device
         rollback_completed_devices
@@ -812,6 +1007,16 @@ main() {
     local bdf
     local -a devices=()
 
+    case "$#" in
+        0) ;;
+        1)
+            [[ "$1" == "--migrate-only" ]] ||
+                fatal "Usage: $0 [--migrate-only]"
+            MIGRATE_ONLY=1
+            ;;
+        *) fatal "Usage: $0 [--migrate-only]" ;;
+    esac
+
     [[ "$WAIT_SECONDS" =~ ^[1-9][0-9]*$ && ${#WAIT_SECONDS} -le 6 ]] ||
         fatal "PVE_GPU_SRIOV_WAIT_SECONDS must be a positive integer"
     if [[ -n "$SYSFS_ROOT" ]]; then
@@ -832,6 +1037,11 @@ main() {
     fi
 
     parse_ini "$SRIOV_CONF"
+    migrate_legacy_config
+    if (( MIGRATE_ONLY == 1 )); then
+        log "SR-IOV configuration migration check completed"
+        return 0
+    fi
     discover_devices
     if (( ${#DEVICE_SECTIONS[@]} == 0 )); then
         log "No persistent SR-IOV device sections found; nothing to restore"

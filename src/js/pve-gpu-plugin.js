@@ -1,6 +1,6 @@
 /*
  * GPU Manager for Proxmox VE
- * ExtJS 7 frontend for Intel discrete GPU SR-IOV management
+ * ExtJS 7 frontend for supported Intel Battlemage SR-IOV management
  *
  * Registers a "GPU" tab in PVE.node.Config with:
  *   - Device grid (auto-refresh 30s)
@@ -195,13 +195,20 @@ Ext.define('PVE.window.GpuVfioDialog', {
         var target = field ? field.getValue() : null;
         var rec = me.deviceRecord;
         var activeVfs = rec ? Number(rec.get('sriov_numvfs') || 0) : 0;
-        var blocked = target === 'vfio-pci' && activeVfs > 0;
+        var pfAssigned = rec ? !!rec.get('pf_assigned') : false;
+        var pfVmid = rec ? rec.get('pf_vmid') : null;
+        var blocked = pfAssigned || (target === 'vfio-pci' && activeVfs > 0);
         var warning = me.down('#warning');
 
         if (warning) {
             if (blocked) {
                 warning.setHtml('<i class="fa fa-ban"></i> ' +
-                    Ext.htmlEncode(gettext('Stop and remove all active VFs before binding the PF to vfio-pci.')));
+                    Ext.htmlEncode(pfAssigned ?
+                        Ext.String.format(
+                            gettext('Detach this physical GPU from VM {0} before changing its driver.'),
+                            pfVmid || '?'
+                        ) :
+                        gettext('Stop and remove all active VFs before binding the PF to vfio-pci.')));
                 warning.setStyle('background', '#fde2e2');
                 warning.setStyle('border-color', '#d66');
                 warning.setStyle('color', '#7a1d1d');
@@ -454,20 +461,20 @@ Ext.define('PVE.grid.GpuDeviceGrid', {
         {
             header: gettext('VFIO'),
             dataIndex: 'vfio_configured',
-            width: 90,
+            width: 155,
             align: 'center',
             renderer: function(val, meta, record) {
                 meta.tdStyle = 'cursor:pointer;';
                 meta.tdAttr = 'data-qtip="' + Ext.htmlEncode(
                     gettext('Click to choose the PF driver')
                 ) + '"';
-                if (val) {
-                    return '<span style="color:#e84040;font-weight:bold;">' +
-                        '<i class="fa fa-plug"></i> vfio-pci</span>';
-                }
                 var driver = record.get('driver') || gettext('Unbound');
-                return '<span style="color:#2673b8;text-decoration:underline;">' +
-                    Ext.htmlEncode(driver) + '</span>';
+                var liveColour = driver === 'vfio-pci' ? '#e84040' : '#2673b8';
+                return '<span style="color:' + liveColour + ';font-weight:bold;text-decoration:underline;">' +
+                    Ext.htmlEncode(gettext('Live') + ': ' + driver) + '</span><br>' +
+                    '<span style="color:#777;font-size:90%;">' +
+                    Ext.htmlEncode(gettext('Boot VFIO') + ': ' + (val ? gettext('Yes') : gettext('No'))) +
+                    '</span>';
             }
         }
     ],
@@ -487,6 +494,8 @@ Ext.define('PVE.grid.GpuDeviceGrid', {
         var me = this;
 
         me.callParent();
+
+        me.reloadRequestId = 0;
 
         me.on('selectionchange', function(selModel, records) {
             if (records.length > 0) {
@@ -532,34 +541,49 @@ Ext.define('PVE.grid.GpuDeviceGrid', {
 
         var selected = me.getSelectionModel().getSelection();
         var selectedBdf = preferredBdf || (selected.length ? selected[0].get('bdf') : null);
+        var requestId = ++me.reloadRequestId;
 
         Proxmox.Utils.API2Request({
             url: '/nodes/' + encodeURIComponent(nodeName) + '/hardware/gpu',
             method: 'GET',
             success: function(response) {
+                if (requestId !== me.reloadRequestId) {
+                    return;
+                }
                 var data = response.result && response.result.data;
                 if (Ext.isArray(data)) {
                     var store = me.getStore();
+                    var currentSelection = me.getSelectionModel().getSelection();
+                    var currentBdf = currentSelection.length ? currentSelection[0].get('bdf') : null;
+                    var desiredBdf = currentBdf || selectedBdf;
                     store.loadData(data);
 
                     // loadData replaces records, so explicitly restore the
                     // selected BDF.  On first entry (or when it disappeared),
                     // select the first GPU so the detail panel is populated.
-                    var next = selectedBdf ? store.findRecord('bdf', selectedBdf) : null;
+                    var next = desiredBdf ? store.findRecord('bdf', desiredBdf) : null;
                     next = next || store.getAt(0);
                     if (next) {
                         Ext.defer(function() {
-                            if (me.destroyed || me.isDestroyed) {
+                            if (me.destroyed || me.isDestroyed || requestId !== me.reloadRequestId) {
+                                return;
+                            }
+                            var latest = me.getSelectionModel().getSelection();
+                            if (latest.length && latest[0].get('bdf') !== desiredBdf) {
                                 return;
                             }
                             me.getSelectionModel().select(next);
                         }, 0);
                     } else {
                         me.getSelectionModel().deselectAll();
+                        me.fireEvent('deviceselect', me, null);
                     }
                 }
             },
             failure: function(response, opts, error) {
+                if (requestId !== me.reloadRequestId) {
+                    return;
+                }
                 Ext.Msg.alert(gettext('Error'), Ext.String.format(
                     gettext('Failed to load GPU devices: {0}'),
                     error || response.htmlStatus
@@ -815,6 +839,7 @@ Ext.define('PVE.panel.GpuTelemetryCard', {
         me.callParent();
 
         me.taskRunner = new Ext.util.TaskRunner();
+        me.telemetryRequestId = 0;
 
         me.on('afterrender', function() {
             me.refreshTask = me.taskRunner.start({
@@ -832,9 +857,10 @@ Ext.define('PVE.panel.GpuTelemetryCard', {
 
     loadDevice: function(record) {
         var me = this;
+        me.clearDisplay();
         if (!record) {
-            me.clearDisplay();
             me.currentBdf = null;
+            me.telemetryRequestId++;
             return;
         }
         me.currentBdf = record.get('bdf');
@@ -850,16 +876,19 @@ Ext.define('PVE.panel.GpuTelemetryCard', {
         if (!nodeName || !me.currentBdf) {
             return;
         }
+        var bdf = me.currentBdf;
+        var requestId = ++me.telemetryRequestId;
 
         Proxmox.Utils.API2Request({
             url: '/nodes/' + encodeURIComponent(nodeName) +
-                 '/hardware/gpu/' + encodeURIComponent(me.currentBdf),
+                 '/hardware/gpu/' + encodeURIComponent(bdf),
             method: 'GET',
             success: function(response) {
-                var data = response.result && response.result.data;
-                if (data && data.telemetry) {
-                    me.updateDisplay(data.telemetry);
+                if (requestId !== me.telemetryRequestId || me.currentBdf !== bdf) {
+                    return;
                 }
+                var data = response.result && response.result.data;
+                me.updateDisplay(data && data.telemetry);
             },
             failure: Ext.emptyFn  // silent fail on telemetry refresh
         });
@@ -867,8 +896,8 @@ Ext.define('PVE.panel.GpuTelemetryCard', {
 
     updateDisplay: function(telemetry) {
         var me = this;
+        me.clearDisplay();
         if (!telemetry) {
-            me.clearDisplay();
             return;
         }
 
@@ -947,6 +976,8 @@ Ext.define('PVE.panel.GpuTelemetryCard', {
         if (fanVal) { fanVal.setText('-'); }
         var memBar = me.down('#memBar');
         if (memBar) { memBar.updateProgress(0, '-'); }
+        var memRange = me.down('#memRange');
+        if (memRange) { memRange.setText('0  \u2015  0'); }
     }
 });
 
@@ -965,12 +996,13 @@ Ext.define('PVE.panel.GpuPrecheckBar', {
     initComponent: function() {
         var me = this;
 
-        me.items = me.buildCheckItems([
-            { itemId: 'checkCpu', label: gettext('CPU Virtualization') },
-            { itemId: 'checkIommu', label: gettext('IOMMU') },
-            { itemId: 'checkBios', label: gettext('SR-IOV BIOS') },
-            { itemId: 'checkDriver', label: gettext('GPU Driver') }
-        ]);
+        me.checkDefinitions = [
+            { name: 'cpu_virtualization', itemId: 'checkCpu', label: gettext('CPU Virtualization') },
+            { name: 'iommu', itemId: 'checkIommu', label: gettext('IOMMU') },
+            { name: 'sriov_bios', itemId: 'checkBios', label: gettext('SR-IOV BIOS') },
+            { name: 'gpu_driver', itemId: 'checkDriver', label: gettext('GPU Driver') }
+        ];
+        me.items = me.buildCheckItems(me.checkDefinitions);
 
         me.callParent();
     },
@@ -1009,50 +1041,46 @@ Ext.define('PVE.panel.GpuPrecheckBar', {
 
     /**
      * Load precheck results from the sriov API response.
-     * @param {Array} prechecks  Array of { name, passed, message } objects
+     * @param {Object} prechecks  Backend { checks, all_pass } status object
      * @returns {boolean}  true if all prechecks passed
      */
     loadPrechecks: function(prechecks) {
         var me = this;
-        if (!prechecks || !prechecks.length) {
-            return false;
-        }
+        var checks = prechecks && prechecks.checks;
 
-        var idMap = {
-            cpu_virtualization: 'checkCpu',
-            iommu: 'checkIommu',
-            sriov_bios: 'checkBios',
-            gpu_driver: 'checkDriver'
-        };
-
-        var allPass = true;
-
-        prechecks.forEach(function(check) {
-            var containerItemId = idMap[check.name];
-            if (!containerItemId) { return; }
-            var container = me.down('#' + containerItemId);
+        me.checkDefinitions.forEach(function(definition) {
+            var container = me.down('#' + definition.itemId);
             if (!container) { return; }
 
             var icon = container.down('#icon');
             var msg = container.down('#msg');
+            var check = checks && checks[definition.name];
 
-            if (check.passed) {
+            if (!check) {
+                if (icon) {
+                    icon.update('<i class="fa fa-question-circle" style="font-size:20px;color:#aaa;"></i>');
+                }
+                if (msg) { msg.setText(''); }
+                container.setStyle({ background: '#f5f5f5', borderColor: '#ddd' });
+                return;
+            }
+
+            if (check.pass) {
                 if (icon) {
                     icon.update('<i class="fa fa-check-circle" style="font-size:20px;color:#26a826;"></i>');
                 }
                 if (msg) { msg.setText(gettext('Pass')); }
-                container.setStyle('background:#efffef;border-color:#b0d8b0;');
+                container.setStyle({ background: '#efffef', borderColor: '#b0d8b0' });
             } else {
-                allPass = false;
                 if (icon) {
                     icon.update('<i class="fa fa-times-circle" style="font-size:20px;color:#e84040;"></i>');
                 }
-                if (msg) { msg.setText(check.message || gettext('Failed')); }
-                container.setStyle('background:#fff2f2;border-color:#d8b0b0;');
+                if (msg) { msg.setText(check.detail || gettext('Failed')); }
+                container.setStyle({ background: '#fff2f2', borderColor: '#d8b0b0' });
             }
         });
 
-        return allPass;
+        return !!(prechecks && prechecks.all_pass);
     }
 });
 
@@ -1296,6 +1324,8 @@ Ext.define('PVE.window.ModifyVfsDialog', {
             (rec ? rec.get('sriov_maxvfs') : 0)) || 0;
         var schedulerCaps = caps.scheduler || {};
         var persisted = status.persisted_config || {};
+        var persistEnabled = status.persisted_config !== undefined ?
+            Number(persisted.persist || 0) === 1 : !!(rec && rec.get('persisted'));
         var currentScheduler = status.scheduler_priority || status.sched_priority ||
             persisted.sched_priority || schedulerCaps.default || 'low';
 
@@ -1443,7 +1473,7 @@ Ext.define('PVE.window.ModifyVfsDialog', {
                 itemId: 'persistCb',
                 fieldLabel: gettext('Persist across reboots'),
                 labelWidth: 160,
-                checked: true,
+                checked: persistEnabled,
                 inputValue: 1,
                 uncheckedValue: 0
             },
@@ -1614,6 +1644,14 @@ Ext.define('PVE.window.ModifyVfsDialog', {
         var blocked = (me.sriovStatus && me.sriovStatus.change_blocked) || {};
         me.hasAssignedConsumer = me.hasAssignedConsumer || !!blocked.topology;
         me.hasRunningConsumer = me.hasRunningConsumer || !!blocked.resources;
+
+        var persistField = me.down('#persistCb');
+        if (persistField) {
+            if (me.hasAssignedConsumer) {
+                persistField.setValue(true);
+            }
+            persistField.setDisabled(me.hasAssignedConsumer);
+        }
 
         me.updateConsumerSummary();
         me.rebuildVfRows();
@@ -2075,13 +2113,29 @@ Ext.define('PVE.window.AssignVfDialog', {
     config: {
         pveSelNode: null,
         deviceRecord: null,
-        vfRecord: null
+        vfRecord: null,
+        assignmentPersistent: false
     },
 
     initComponent: function() {
         var me = this;
         var vf = me.vfRecord;
         var currentVmid = Number(vf.get('vmid')) || 0;
+        var assignmentPersistent = me.getAssignmentPersistent();
+        var initialRows = [{
+            vmid: 0,
+            name: '',
+            status: 'none',
+            label: '\u2014 ' + gettext('None (unassigned)')
+        }];
+        if (currentVmid && !assignmentPersistent) {
+            initialRows.push({
+                vmid: currentVmid,
+                name: '',
+                status: 'stopped',
+                label: currentVmid + ' \u2014 ' + gettext('current VM')
+            });
+        }
 
         me.currentVmid = currentVmid;
         me.vmStore = Ext.create('Ext.data.Store', {
@@ -2091,12 +2145,7 @@ Ext.define('PVE.window.AssignVfDialog', {
                 'status',
                 'label'
             ],
-            data: [{
-                vmid: 0,
-                name: '',
-                status: 'none',
-                label: '\u2014 ' + gettext('None (unassigned)')
-            }],
+            data: initialRows,
             sorters: [{ property: 'vmid', direction: 'ASC' }]
         });
 
@@ -2146,6 +2195,14 @@ Ext.define('PVE.window.AssignVfDialog', {
                 margin: '10 0 0 135',
                 style: 'color:#666;',
                 html: Ext.htmlEncode(gettext('Only stopped, unlocked QEMU VMs are listed. The VM must be stopped before assigning or removing a VF.'))
+            },
+            {
+                xtype: 'component',
+                hidden: assignmentPersistent,
+                margin: '10 0 0 135',
+                padding: 7,
+                style: 'background:#fff3cd;border:1px solid #e0ae38;color:#6b4b00;',
+                html: Ext.htmlEncode(gettext('This VF has no persistent SR-IOV profile. Only rescue unassignment to None is available.'))
             }
         ];
 
@@ -2164,7 +2221,9 @@ Ext.define('PVE.window.AssignVfDialog', {
         ];
 
         me.callParent();
-        me.on('afterrender', function() { me.loadVms(); }, me, { single: true });
+        if (assignmentPersistent) {
+            me.on('afterrender', function() { me.loadVms(); }, me, { single: true });
+        }
     },
 
     nodeName: function() {
@@ -2310,6 +2369,8 @@ Ext.define('PVE.panel.GpuSriovPanel', {
 
         me.sriovStatus = null;
         me.vfDataLoaded = false;
+        me.sriovRequestId = 0;
+        me.vfRequestId = 0;
 
         me.items = [
             // Drift banner
@@ -2327,6 +2388,10 @@ Ext.define('PVE.panel.GpuSriovPanel', {
                 padding: '6 8',
                 style: 'border-bottom:1px solid #ddd;color:#666;',
                 html: Ext.htmlEncode(gettext('Scheduler: loading...'))
+            },
+            {
+                xtype: 'gpuPrecheckBar',
+                itemId: 'precheckBar'
             },
             // VF grid
             {
@@ -2424,10 +2489,23 @@ Ext.define('PVE.panel.GpuSriovPanel', {
         me.deviceRecord = deviceRecord;
         me.sriovStatus = null;
         me.vfDataLoaded = false;
+        me.sriovRequestId++;
+        me.vfRequestId++;
+
+        var vfGrid = me.down('#vfGrid');
+        vfGrid.getStore().removeAll();
+        me.down('#modifyVfsBtn').setDisabled(true);
+        me.down('#driftBanner').hide();
+        me.down('#precheckBar').loadPrechecks(null);
+        me.down('#precheckBar').show();
+        me.down('#schedulerStatus').setHtml(
+            Ext.htmlEncode(gettext('Scheduler: loading...'))
+        );
 
         var maxVfs = deviceRecord ? (deviceRecord.get('sriov_maxvfs') || 0) : 0;
         var driver = deviceRecord ? (deviceRecord.get('driver') || '') : '';
         if (maxVfs <= 0 && driver !== 'vfio-pci') {
+            me.setTitle(gettext('SR-IOV Virtual Functions'));
             me.hide();
             return;
         }
@@ -2440,6 +2518,7 @@ Ext.define('PVE.panel.GpuSriovPanel', {
             me.enable();
             me.setTitle(gettext('SR-IOV Virtual Functions') + ' \u2014 ' +
                 Ext.String.format(gettext('GPU assigned to VM {0}'), pfVmid || '?'));
+            me.down('#precheckBar').hide();
             me.down('#modifyVfsBtn').setDisabled(true);
             me.reloadVfs();
             return;
@@ -2456,15 +2535,20 @@ Ext.define('PVE.panel.GpuSriovPanel', {
         var nodeName = me.pveSelNode && me.pveSelNode.data ? me.pveSelNode.data.node : undefined;
         var bdf = me.deviceRecord ? me.deviceRecord.get('bdf') : null;
         if (!nodeName || !bdf) { return; }
+        var requestId = ++me.sriovRequestId;
 
         Proxmox.Utils.API2Request({
             url: '/nodes/' + encodeURIComponent(nodeName) +
                  '/hardware/gpu/' + encodeURIComponent(bdf) + '/sriov',
             method: 'GET',
             success: function(response) {
+                if (requestId !== me.sriovRequestId || !me.isCurrentDevice(bdf)) {
+                    return;
+                }
                 var data = response.result && response.result.data;
                 if (!data) { return; }
                 me.sriovStatus = data;
+                me.down('#precheckBar').loadPrechecks(data.prechecks);
 
                 // The v2 status response includes the same live VF records as
                 // the list endpoint.  Load them immediately so the editor and
@@ -2516,6 +2600,9 @@ Ext.define('PVE.panel.GpuSriovPanel', {
                 me.updateModifyButton();
             },
             failure: function(response, opts, error) {
+                if (requestId !== me.sriovRequestId || !me.isCurrentDevice(bdf)) {
+                    return;
+                }
                 Ext.Msg.alert(gettext('Error'), Ext.String.format(
                     gettext('Failed to load SR-IOV status: {0}'),
                     error || response.htmlStatus
@@ -2529,12 +2616,16 @@ Ext.define('PVE.panel.GpuSriovPanel', {
         var nodeName = me.pveSelNode && me.pveSelNode.data ? me.pveSelNode.data.node : undefined;
         var bdf = me.deviceRecord ? me.deviceRecord.get('bdf') : null;
         if (!nodeName || !bdf) { return; }
+        var requestId = ++me.vfRequestId;
 
         Proxmox.Utils.API2Request({
             url: '/nodes/' + encodeURIComponent(nodeName) +
                  '/hardware/gpu/' + encodeURIComponent(bdf) + '/vf',
             method: 'GET',
             success: function(response) {
+                if (requestId !== me.vfRequestId || !me.isCurrentDevice(bdf)) {
+                    return;
+                }
                 var data = response.result && response.result.data;
                 var store = me.down('#vfGrid').getStore();
                 store.removeAll();
@@ -2545,12 +2636,19 @@ Ext.define('PVE.panel.GpuSriovPanel', {
                 me.updateModifyButton();
             },
             failure: function() {
+                if (requestId !== me.vfRequestId || !me.isCurrentDevice(bdf)) {
+                    return;
+                }
                 var store = me.down('#vfGrid').getStore();
                 store.removeAll();
                 me.vfDataLoaded = false;
                 me.updateModifyButton();
             }
         });
+    },
+
+    isCurrentDevice: function(bdf) {
+        return !!this.deviceRecord && this.deviceRecord.get('bdf') === bdf;
     },
 
     updateModifyButton: function() {
@@ -2640,10 +2738,22 @@ Ext.define('PVE.panel.GpuSriovPanel', {
             return;
         }
 
+        var persisted = status.persisted_config || {};
+        var assignmentPersistent = Number(persisted.persist || 0) === 1;
+        var currentVmid = Number(vfRecord.get('vmid')) || 0;
+        if (!assignmentPersistent && !currentVmid) {
+            Ext.Msg.alert(
+                gettext('Persistent profile required'),
+                gettext('Enable Persist across reboots in Modify VFs before assigning this VF to a VM.')
+            );
+            return;
+        }
+
         var dlg = Ext.create('PVE.window.AssignVfDialog', {
             pveSelNode: me.pveSelNode,
             deviceRecord: me.deviceRecord,
-            vfRecord: vfRecord
+            vfRecord: vfRecord,
+            assignmentPersistent: assignmentPersistent
         });
         dlg.on('assignmentchanged', function() {
             Ext.defer(function() {
@@ -2722,6 +2832,9 @@ Ext.define('PVE.panel.GpuDeviceDetail', {
         var me = this;
         if (!record) {
             me.setTitle(gettext('Device Detail'));
+            me.down('#propsCard').loadRecord(null);
+            me.down('#telemetryCard').loadDevice(null);
+            me.down('#sriovPanel').loadDevice(null);
             return;
         }
 

@@ -3,7 +3,11 @@
 
 set -e
 
-PATCH_SCRIPT=/usr/lib/pve-gpu/reapply-patches.sh
+PATCH_SCRIPT=${PVE_GPU_PATCH_SCRIPT:-/usr/lib/pve-gpu/reapply-patches.sh}
+SRIOV_SCRIPT=${PVE_GPU_SRIOV_SCRIPT:-/usr/lib/pve-gpu/apply-sriov-config.sh}
+LEGACY_MODPROBE_CONF=${PVE_GPU_LEGACY_MODPROBE_CONF:-/etc/modprobe.d/pve-gpu-vfio.conf}
+LEGACY_MODULES_CONF=${PVE_GPU_LEGACY_MODULES_CONF:-/etc/modules-load.d/pve-gpu-vfio.conf}
+GRUB_DEFAULT=${PVE_GPU_GRUB_DEFAULT:-/etc/default/grub}
 
 log() {
     logger -t pve-gpu-postinst "$@" 2>/dev/null || true
@@ -23,13 +27,78 @@ enable_services() {
     # this service restores them only during a later boot, before pve-guests.
 }
 
+has_package_owned_grub_vfio_ids() {
+    [ -f "$GRUB_DEFAULT" ] || return 1
+    grub_line=$(grep '^GRUB_CMDLINE_LINUX_DEFAULT=' "$GRUB_DEFAULT") || return 1
+    printf '%s\n' "$grub_line" |
+        grep -Eq "(^|[[:space:]])intel_iommu=on([[:space:]]|[\"'])" || return 1
+    printf '%s\n' "$grub_line" |
+        grep -Eq "(^|[[:space:]])iommu=pt([[:space:]]|[\"'])" || return 1
+    printf '%s\n' "$grub_line" |
+        grep -Eq "(^|[[:space:]])vfio-pci\\.ids=8086:(56c0|56c1|56c2|0bd4|0bd5|0bd6|0bda|0bdb|0b6e|e211|e212|e222|e223)(,8086:(56c0|56c1|56c2|0bd4|0bd5|0bd6|0bda|0bdb|0b6e|e211|e212|e222|e223))*[\"'][[:space:]]*$"
+}
+
+remove_legacy_vfio_policy() {
+    old_version=$1
+    legacy_vfio_policy=0
+    legacy_grub_policy=0
+    legacy_grub_upgrade=0
+    for path in \
+        "$LEGACY_MODPROBE_CONF" \
+        "$LEGACY_MODULES_CONF"
+    do
+        if [ -e "$path" ]; then
+            legacy_vfio_policy=1
+            rm -f "$path"
+        fi
+    done
+
+    case "$old_version" in
+        1.0.0-1|1.1.0-1|1.1.0-2|1.1.0-3)
+            legacy_grub_upgrade=1
+            ;;
+    esac
+
+    if { [ "$legacy_vfio_policy" = 1 ] || [ "$legacy_grub_upgrade" = 1 ]; } &&
+       has_package_owned_grub_vfio_ids; then
+        perl -pi -e "if (/^GRUB_CMDLINE_LINUX_DEFAULT=/) { s/[ \t]+vfio-pci\.ids=[^ \t\r\n\"']+//g }" "$GRUB_DEFAULT"
+        legacy_grub_policy=1
+        if command -v update-grub >/dev/null 2>&1; then
+            update-grub
+        fi
+    fi
+
+    if [ "$legacy_vfio_policy" = 1 ]; then
+        if command -v update-initramfs >/dev/null 2>&1; then
+            update-initramfs -u
+        fi
+    fi
+    if [ "$legacy_vfio_policy" = 1 ] && [ "$legacy_grub_policy" = 1 ]; then
+        log "Removed the legacy global VFIO driver policy and vfio-pci.ids kernel argument"
+    elif [ "$legacy_vfio_policy" = 1 ]; then
+        log "Removed the legacy global VFIO driver policy"
+    elif [ "$legacy_grub_policy" = 1 ]; then
+        log "Removed the legacy package-owned vfio-pci.ids kernel argument"
+    fi
+}
+
 case "$1" in
     configure)
         if [ ! -x "$PATCH_SCRIPT" ]; then
             log "ERROR: $PATCH_SCRIPT is missing or not executable"
             exit 1
         fi
-        "$PATCH_SCRIPT" --apply
+        if [ ! -x "$SRIOV_SCRIPT" ]; then
+            log "ERROR: $SRIOV_SCRIPT is missing or not executable"
+            exit 1
+        fi
+        "$SRIOV_SCRIPT" --migrate-only
+        remove_legacy_vfio_policy "${2:-}"
+        if [ -n "${2:-}" ]; then
+            "$PATCH_SCRIPT" --apply --force-restart
+        else
+            "$PATCH_SCRIPT" --apply
+        fi
         enable_services
         ;;
     abort-upgrade|abort-remove|abort-deconfigure)

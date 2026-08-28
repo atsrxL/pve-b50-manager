@@ -1,5 +1,9 @@
 # PVE GPU/GPU Manager Plugin — Design Brief
 
+> Historical upstream design reference. The shipped implementation is limited
+> to the validated Intel Battlemage IDs and xe ABI documented in `README.md`;
+> the Flex/PVC examples below are not current support claims.
+
 ## 1. Project Overview
 
 A Proxmox VE web UI plugin that provides per-host discovery, monitoring, and SR-IOV virtual function management for Intel discrete GPUs (Data Center GPU Flex / ATS-M, Ponte Vecchio, Battlemage).

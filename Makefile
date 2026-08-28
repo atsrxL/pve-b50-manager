@@ -12,8 +12,6 @@ install:
 		$(DESTDIR)$(PREFIX)/share/perl5/PVE/API2/Hardware/GPU.pm
 	install -D -m 0644 src/PVE/API2/Hardware/GPU/Intel.pm \
 		$(DESTDIR)$(PREFIX)/share/perl5/PVE/API2/Hardware/GPU/Intel.pm
-	install -D -m 0644 src/PVE/API2/Hardware/GPU/Nvidia.pm \
-		$(DESTDIR)$(PREFIX)/share/perl5/PVE/API2/Hardware/GPU/Nvidia.pm
 	install -D -m 0644 src/PVE/GPU/SRIOV.pm \
 		$(DESTDIR)$(PREFIX)/share/perl5/PVE/GPU/SRIOV.pm
 	# JavaScript plugin
