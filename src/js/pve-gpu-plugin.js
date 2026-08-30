@@ -47,6 +47,41 @@ function gpuTempColour(temp) {
     return '#26a826'; // green
 }
 
+/**
+ * Normalise a boolean value returned by the PVE API.  Some older PVE
+ * serializers return 0/1 while newer ones return JSON booleans.
+ * @param {*} value
+ * @returns {boolean}
+ */
+function gpuAtsBoolean(value) {
+    return value === true || value === 1 || value === '1' || value === 'true';
+}
+
+function gpuTelemetrySleeping(telemetry) {
+    return !!telemetry && gpuAtsBoolean(telemetry.sleeping);
+}
+
+/**
+ * The ATS endpoint is deliberately fail-closed when a field is missing.
+ * @param {Object} policy
+ * @returns {boolean}
+ */
+function gpuAtsPolicyComplete(policy) {
+    var fields = [
+        'affected', 'active_noats', 'ats_supported', 'ats_enabled',
+        'persistent_noats', 'managed', 'safe', 'reboot_required', 'reason'
+    ];
+    if (!policy || typeof policy !== 'object') {
+        return false;
+    }
+    for (var i = 0; i < fields.length; i++) {
+        if (policy[fields[i]] === undefined || policy[fields[i]] === null) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /* =========================================================================
  * GpuDeviceStore — backs the main device grid
  * ========================================================================= */
@@ -77,7 +112,8 @@ Ext.define('PVE.store.GpuDevices', {
         { name: 'assigned_vms', type: 'auto' },
         { name: 'pf_assigned', type: 'boolean' },
         { name: 'pf_vmid', type: 'auto' },
-        { name: 'vfio_configured', type: 'boolean' }
+        { name: 'vfio_configured', type: 'boolean' },
+        { name: 'power_mode', type: 'string', defaultValue: 'normal' }
     ],
 
     proxy: {
@@ -273,7 +309,10 @@ Ext.define('PVE.grid.GpuDeviceGrid', {
 
     title: gettext('GPU Devices'),
     collapsible: false,
-    stateful: false,
+    // PVE.StateProvider extends Ext.state.LocalStorageProvider, so native
+    // grid state keeps user-resized columns in this browser across reloads.
+    stateful: true,
+    stateId: 'grid-pve-gpu-devices-v1',
 
     config: {
         pveSelNode: null
@@ -293,7 +332,20 @@ Ext.define('PVE.grid.GpuDeviceGrid', {
             header: gettext('Device'),
             dataIndex: 'device_name',
             flex: 1,
-            minWidth: 180
+            minWidth: 220,
+            renderer: function(val) {
+                var name = val || gettext('Unknown GPU');
+                var tip = gettext('Open device properties');
+                return '<a href="#" class="pve-gpu-device-info" role="button" ' +
+                    'aria-label="' + Ext.htmlEncode(tip + ': ' + name) + '" ' +
+                    'data-qtip="' + Ext.htmlEncode(tip) + '" ' +
+                    'style="display:inline-flex;width:18px;height:18px;' +
+                    'align-items:center;justify-content:center;margin-right:6px;' +
+                    'border:1px solid #2673b8;border-radius:50%;' +
+                    'color:#2673b8;text-decoration:none;vertical-align:middle;">' +
+                    '<i class="fa fa-info" aria-hidden="true"></i></a>' +
+                    '<span>' + Ext.htmlEncode(name) + '</span>';
+            }
         },
         {
             header: gettext('BDF'),
@@ -338,6 +390,11 @@ Ext.define('PVE.grid.GpuDeviceGrid', {
             align: 'center',
             renderer: function(telemetry) {
                 if (!telemetry) { return '-'; }
+                if (gpuTelemetrySleeping(telemetry)) {
+                    return '<span style="color:#2673b8;" data-qtip="' +
+                        Ext.htmlEncode(gettext('Telemetry is paused to avoid waking the GPU')) + '">' +
+                        '<i class="fa fa-moon-o"></i> ' + gettext('Sleep') + '</span>';
+                }
                 if (telemetry.power_w !== null && telemetry.power_w !== undefined) {
                     return telemetry.power_w + 'W';
                 }
@@ -362,7 +419,7 @@ Ext.define('PVE.grid.GpuDeviceGrid', {
             }
         },
         {
-            header: gettext('VRAM'),
+            header: gettext('LMEM / VRAM'),
             dataIndex: 'telemetry',
             width: 140,
             renderer: function(telemetry) {
@@ -407,6 +464,10 @@ Ext.define('PVE.grid.GpuDeviceGrid', {
             align: 'center',
             renderer: function(telemetry) {
                 if (!telemetry || !telemetry.health) { return '-'; }
+                if (gpuTelemetrySleeping(telemetry)) {
+                    return '<span style="color:#2673b8;"><i class="fa fa-moon-o"></i> ' +
+                        gettext('Sleep') + '</span>';
+                }
                 if (telemetry.health === 'OK') {
                     return '<span style="color:#26a826;"><i class="fa fa-check-circle"></i> OK</span>';
                 }
@@ -464,6 +525,13 @@ Ext.define('PVE.grid.GpuDeviceGrid', {
             width: 155,
             align: 'center',
             renderer: function(val, meta, record) {
+                if ((record.get('power_mode') || 'normal') !== 'normal') {
+                    meta.tdAttr = 'data-qtip="' + Ext.htmlEncode(
+                        gettext('Exit Power Saving before changing the PF driver')
+                    ) + '"';
+                    return '<span style="color:#2673b8;"><i class="fa fa-moon-o"></i> ' +
+                        Ext.htmlEncode(gettext('Sleeping')) + '</span>';
+                }
                 meta.tdStyle = 'cursor:pointer;';
                 meta.tdAttr = 'data-qtip="' + Ext.htmlEncode(
                     gettext('Click to choose the PF driver')
@@ -493,20 +561,56 @@ Ext.define('PVE.grid.GpuDeviceGrid', {
     initComponent: function() {
         var me = this;
 
+        // Keep ATS policy access beside the GPU Devices title instead of
+        // consuming permanent workspace below the device list.
+        me.header = {
+            items: [
+                {
+                    xtype: 'button',
+                    itemId: 'powerPolicyBtn',
+                    text: gettext('Power Saving'),
+                    iconCls: 'fa fa-leaf',
+                    disabled: true,
+                    handler: function() {
+                        var selected = me.getSelectionModel().getSelection();
+                        me.fireEvent('powerpolicyclick', me, selected.length ? selected[0] : null);
+                    }
+                },
+                {
+                    xtype: 'button',
+                    itemId: 'atsPolicyBtn',
+                    text: gettext('ATS Policy'),
+                    iconCls: 'fa fa-shield',
+                    disabled: true,
+                    handler: function() {
+                        var selected = me.getSelectionModel().getSelection();
+                        me.fireEvent('atspolicyclick', me, selected.length ? selected[0] : null);
+                    }
+                }
+            ]
+        };
+
         me.callParent();
 
         me.reloadRequestId = 0;
 
         me.on('selectionchange', function(selModel, records) {
-            if (records.length > 0) {
-                var rec = records[0];
-                me.fireEvent('deviceselect', me, rec);
-            }
+            var rec = records.length > 0 ? records[0] : null;
+            var powerActive = rec && (rec.get('power_mode') || 'normal') !== 'normal';
+            me.down('#powerPolicyBtn').setDisabled(!rec);
+            me.down('#atsPolicyBtn').setDisabled(!rec || powerActive);
+            me.fireEvent('deviceselect', me, rec);
         });
 
         me.on('cellclick', function(view, td, cellIndex, record, tr, rowIndex, e) {
+            if (e.getTarget('.pve-gpu-device-info')) {
+                e.stopEvent();
+                me.fireEvent('deviceinfoclick', me, record, e);
+                return;
+            }
             var column = view.getHeaderCt().getHeaderAtIndex(cellIndex);
-            if (column && column.dataIndex === 'vfio_configured') {
+            if (column && column.dataIndex === 'vfio_configured' &&
+                (record.get('power_mode') || 'normal') === 'normal') {
                 me.fireEvent('vfioclick', me, record, e);
             }
         });
@@ -662,6 +766,8 @@ Ext.define('PVE.panel.GpuPropertiesCard', {
         }
         var data = record.getData();
         var rows = [
+            { label: gettext('Device'), value: Ext.htmlEncode(data.device_name || '-') },
+            { label: gettext('PCI Address'), value: Ext.htmlEncode(data.bdf || '-') },
             { label: gettext('Family'), value: Ext.htmlEncode(data.family || '-') },
             { label: gettext('Device ID'), value: Ext.htmlEncode(data.device_id || '-') },
             { label: gettext('Vendor ID'), value: Ext.htmlEncode(data.vendor_id || '-') },
@@ -672,9 +778,61 @@ Ext.define('PVE.panel.GpuPropertiesCard', {
             { label: gettext('NUMA Node'), value: data.numa_node !== undefined ? String(data.numa_node) : '-' },
             { label: gettext('Tiles'), value: data.tiles !== undefined ? String(data.tiles) : '-' },
             { label: gettext('SR-IOV Max VFs'), value: data.sriov_maxvfs !== undefined ? String(data.sriov_maxvfs) : '-' },
-            { label: gettext('SR-IOV Active VFs'), value: data.sriov_numvfs !== undefined ? String(data.sriov_numvfs) : '-' }
+            { label: gettext('SR-IOV Active VFs'), value: data.sriov_numvfs !== undefined ? String(data.sriov_numvfs) : '-' },
+            { label: gettext('Persistent Profile'), value: data.persisted ? gettext('Configured') : gettext('Not configured') },
+            {
+                label: gettext('Whole-GPU VM'),
+                value: data.pf_assigned ? Ext.htmlEncode(String(data.pf_vmid || gettext('Assigned'))) : gettext('None')
+            }
         ];
         me.down('#propsView').getStore().loadData(rows);
+    }
+});
+
+/* =========================================================================
+ * GpuDevicePropertiesDialog — properties opened from the row info button
+ * ========================================================================= */
+
+Ext.define('PVE.window.GpuDevicePropertiesDialog', {
+    extend: 'Ext.window.Window',
+    alias: 'widget.gpuDevicePropertiesDialog',
+
+    modal: true,
+    width: 560,
+    height: 460,
+    layout: 'fit',
+    closeAction: 'destroy',
+
+    config: {
+        deviceRecord: null
+    },
+
+    initComponent: function() {
+        var me = this;
+        var record = me.deviceRecord;
+        me.title = record ? Ext.String.format(
+            gettext('Device Properties: {0} ({1})'),
+            record.get('device_name'),
+            record.get('bdf')
+        ) : gettext('Device Properties');
+        me.items = [
+            {
+                xtype: 'gpuPropertiesCard',
+                itemId: 'propsCard',
+                title: null,
+                header: false,
+                border: false
+            }
+        ];
+        me.buttons = [
+            {
+                text: gettext('Close'),
+                handler: function() { me.close(); }
+            }
+        ];
+
+        me.callParent();
+        me.down('#propsCard').loadRecord(record);
     }
 });
 
@@ -2349,6 +2507,1141 @@ Ext.define('PVE.window.AssignVfDialog', {
 });
 
 /* =========================================================================
+ * WholeGpuPassthroughDialog — replace all VFs with one whole-PF assignment
+ * ========================================================================= */
+
+Ext.define('PVE.window.WholeGpuPassthroughDialog', {
+    extend: 'Ext.window.Window',
+    alias: 'widget.pveWholeGpuPassthroughDialog',
+
+    title: gettext('Quick Whole-GPU Passthrough'),
+    width: 660,
+    modal: true,
+    resizable: false,
+    bodyPadding: 12,
+    layout: 'anchor',
+
+    config: {
+        pveSelNode: null,
+        deviceRecord: null,
+        sriovStatus: null
+    },
+
+    initComponent: function() {
+        var me = this;
+        var rec = me.deviceRecord;
+        var status = me.sriovStatus || {};
+        var assignments = Ext.Array.filter(
+            Ext.isArray(status.assignments) ? status.assignments : [],
+            function(assignment) { return Number(assignment.vf_index) > 0; }
+        );
+        var running = Ext.Array.filter(assignments, function(assignment) {
+            return !!assignment.running;
+        });
+        var assignmentLabels = Ext.Array.map(assignments, function(assignment) {
+            return 'VF ' + Ext.htmlEncode(String(assignment.vf_index)) +
+                ' → VM ' + Ext.htmlEncode(String(assignment.vmid || '?'));
+        });
+        var bdf = rec ? rec.get('bdf') : null;
+        var deviceName = rec ? (rec.get('device_name') || '-') : '-';
+        var currentPfVmid = rec ? Number(rec.get('pf_vmid')) || 0 : 0;
+        var numVfs = Number(status.sriov_numvfs !== undefined ?
+            status.sriov_numvfs : (rec ? rec.get('sriov_numvfs') : 0)) || 0;
+
+        me.currentBdf = bdf;
+        me.currentPfVmid = currentPfVmid;
+        me.currentPfVm = null;
+        me.currentNumVfs = numVfs;
+        me.assignments = assignments;
+        me.consumerBlockers = Ext.Array.map(running, function(assignment) {
+            return Number(assignment.vmid) || 0;
+        });
+        me.vmRequestId = 0;
+        me.transactionRequestId = 0;
+        me.vmsLoaded = false;
+        me.vmStore = Ext.create('Ext.data.Store', {
+            fields: [
+                { name: 'vmid', type: 'int' },
+                'name',
+                'status',
+                'lock',
+                'label'
+            ],
+            data: [],
+            sorters: [{ property: 'vmid', direction: 'ASC' }]
+        });
+
+        var assignmentSummary = assignmentLabels.length ?
+            assignmentLabels.join(', ') : gettext('No VF VM assignments');
+        var planHtml = '<ol style="margin:0;padding-left:22px;">' +
+            '<li>' + Ext.htmlEncode(Ext.String.format(
+                gettext('Detach all {0} VF VM assignment(s):'),
+                assignments.length
+            )) + ' ' + assignmentSummary + '</li>' +
+            '<li>' + Ext.htmlEncode(Ext.String.format(
+                gettext('Delete all {0} active VF(s) and their persistent SR-IOV profiles.'),
+                numVfs
+            )) + '</li>' +
+            '<li>' + Ext.htmlEncode(gettext('Bind the physical GPU to vfio-pci and persist that boot policy.')) + '</li>' +
+            '<li>' + Ext.htmlEncode(gettext('Assign the whole physical GPU to the selected VM.')) + '</li>' +
+            '<li><strong>' + Ext.htmlEncode(gettext('Scope:')) + '</strong> ' +
+            Ext.htmlEncode(gettext('Only this GPU PF and its VFs are changed. Separate audio or other PCI devices are not moved automatically.')) + '</li>' +
+            '</ol>';
+
+        me.items = [
+            {
+                xtype: 'displayfield',
+                fieldLabel: gettext('Device'),
+                labelWidth: 130,
+                value: Ext.htmlEncode(deviceName + ' (' + (bdf || '-') + ')')
+            },
+            {
+                xtype: 'displayfield',
+                fieldLabel: gettext('Current whole-GPU VM'),
+                labelWidth: 130,
+                value: currentPfVmid ? Ext.htmlEncode(String(currentPfVmid)) : gettext('None')
+            },
+            {
+                xtype: 'component',
+                margin: '4 0 12 0',
+                padding: 9,
+                style: 'background:#fff3cd;border:1px solid #e0ae38;color:#5d4600;',
+                html: '<strong>' + Ext.htmlEncode(gettext('This transaction will:')) + '</strong>' +
+                    planHtml
+            },
+            {
+                xtype: 'combobox',
+                itemId: 'vmField',
+                fieldLabel: gettext('Target VM'),
+                labelWidth: 130,
+                anchor: '100%',
+                store: me.vmStore,
+                queryMode: 'local',
+                editable: false,
+                forceSelection: true,
+                valueField: 'vmid',
+                displayField: 'label',
+                disabled: true,
+                listConfig: {
+                    getInnerTpl: function() {
+                        return '{[Ext.htmlEncode(values.label)]}';
+                    }
+                },
+                listeners: {
+                    change: function() { me.updateState(); }
+                }
+            },
+            {
+                xtype: 'component',
+                margin: '8 0 0 135',
+                style: 'color:#666;',
+                html: Ext.htmlEncode(gettext('Only stopped, unlocked, non-template QEMU VMs are offered as new targets. The current whole-GPU VM remains visible for a no-op verification.'))
+            },
+            {
+                xtype: 'component',
+                itemId: 'operationBlocker',
+                hidden: me.consumerBlockers.length === 0,
+                margin: '12 0 0 0',
+                padding: 8,
+                style: 'background:#fde2e2;border:1px solid #d66;color:#7a1d1d;',
+                html: '<i class="fa fa-ban"></i> ' + Ext.htmlEncode(
+                    me.consumerBlockers.length ? Ext.String.format(
+                        gettext('Stop and unlock every VF consumer VM before switching modes. Blocked VM(s): {0}'),
+                        me.consumerBlockers.join(', ')
+                    ) : ''
+                )
+            },
+            {
+                xtype: 'component',
+                itemId: 'noTargetWarning',
+                hidden: true,
+                margin: '12 0 0 0',
+                padding: 8,
+                style: 'background:#fde2e2;border:1px solid #d66;color:#7a1d1d;',
+                html: '<i class="fa fa-ban"></i> ' +
+                    Ext.htmlEncode(gettext('No stopped, unlocked QEMU VM is available.'))
+            }
+        ];
+
+        me.buttons = [
+            {
+                text: gettext('Cancel'),
+                handler: function() { me.close(); }
+            },
+            {
+                text: gettext('Switch and Assign'),
+                itemId: 'applyWholeGpuBtn',
+                iconCls: 'fa fa-exchange',
+                disabled: true,
+                handler: function() { me.confirmAndSubmit(); }
+            }
+        ];
+
+        me.callParent();
+        me.on('afterrender', function() { me.loadVms(); }, me, { single: true });
+        me.on('destroy', function() {
+            me.vmRequestId++;
+            me.transactionRequestId++;
+        });
+    },
+
+    nodeName: function() {
+        return this.pveSelNode && this.pveSelNode.data ?
+            this.pveSelNode.data.node : undefined;
+    },
+
+    loadVms: function() {
+        var me = this;
+        var nodeName = me.nodeName();
+        var bdf = me.currentBdf;
+        if (!nodeName || !bdf) { return; }
+        var requestId = ++me.vmRequestId;
+
+        me.setLoading(true);
+        Proxmox.Utils.API2Request({
+            url: '/nodes/' + encodeURIComponent(nodeName) + '/qemu',
+            method: 'GET',
+            success: function(response) {
+                if (requestId !== me.vmRequestId || me.currentBdf !== bdf ||
+                    me.destroyed || me.isDestroyed) {
+                    return;
+                }
+                var data = response.result && response.result.data;
+                var rows = [];
+                var vmById = {};
+                Ext.Array.each(Ext.isArray(data) ? data : [], function(vm) {
+                    var vmid = Number(vm.vmid) || 0;
+                    if (!vmid || vm.template) {
+                        return;
+                    }
+                    vmById[vmid] = vm;
+                    var name = vm.name ? String(vm.name) : gettext('unnamed');
+                    if (vmid === me.currentPfVmid) {
+                        me.currentPfVm = vm;
+                    }
+                    if ((vm.status !== 'stopped' || vm.lock) && vmid !== me.currentPfVmid) {
+                        return;
+                    }
+                    var suffix = vmid === me.currentPfVmid ?
+                        gettext('current whole-GPU VM') + ' — ' + String(vm.status || gettext('unknown')) :
+                        gettext('stopped');
+                    rows.push({
+                        vmid: vmid,
+                        name: name,
+                        status: vm.status,
+                        lock: vm.lock,
+                        label: vmid + ' (' + name + ') — ' + suffix
+                    });
+                });
+                var blocked = {};
+                Ext.Array.each(me.assignments, function(assignment) {
+                    var vmid = Number(assignment.vmid) || 0;
+                    var vm = vmById[vmid];
+                    if (vmid && (!vm || vm.status !== 'stopped' || vm.lock)) {
+                        blocked[vmid] = true;
+                    }
+                });
+                me.consumerBlockers = Ext.Object.getKeys(blocked).sort(function(a, b) {
+                    return Number(a) - Number(b);
+                });
+                me.vmStore.loadData(rows);
+                me.vmsLoaded = true;
+                me.setLoading(false);
+                var field = me.down('#vmField');
+                if (field) {
+                    field.setDisabled(rows.length === 0 || me.consumerBlockers.length > 0);
+                    if (me.currentPfVmid && me.vmStore.findRecord('vmid', me.currentPfVmid)) {
+                        field.setValue(me.currentPfVmid);
+                    } else if (rows.length === 1 && me.consumerBlockers.length === 0) {
+                        field.setValue(rows[0].vmid);
+                    }
+                }
+                var noTarget = me.down('#noTargetWarning');
+                if (noTarget) {
+                    noTarget.setVisible(rows.length === 0);
+                }
+                me.updateState();
+            },
+            failure: function(response, opts, error) {
+                if (requestId !== me.vmRequestId || me.currentBdf !== bdf ||
+                    me.destroyed || me.isDestroyed) {
+                    return;
+                }
+                me.vmsLoaded = false;
+                me.setLoading(false);
+                me.updateState();
+                Ext.Msg.alert(gettext('Error'), Ext.String.format(
+                    gettext('Failed to load QEMU VMs: {0}'),
+                    error || response.htmlStatus
+                ));
+            }
+        });
+    },
+
+    updateState: function() {
+        var me = this;
+        var field = me.down('#vmField');
+        var targetVmid = field ? Number(field.getValue()) || 0 : 0;
+        var sameTarget = !!me.currentPfVmid && targetVmid === me.currentPfVmid;
+        var sourceStopped = !me.currentPfVmid || (me.currentPfVm &&
+            me.currentPfVm.status === 'stopped' && !me.currentPfVm.lock);
+        var moveBlocked = !!me.currentPfVmid && !sameTarget && !sourceStopped;
+        var apply = me.down('#applyWholeGpuBtn');
+        if (apply) {
+            apply.setDisabled(!me.vmsLoaded || !targetVmid ||
+                me.consumerBlockers.length > 0 || moveBlocked);
+        }
+        var blocker = me.down('#operationBlocker');
+        if (blocker) {
+            var message = '';
+            if (me.consumerBlockers.length > 0) {
+                message = Ext.String.format(
+                    gettext('Stop and unlock every VF consumer VM before switching modes. Blocked VM(s): {0}'),
+                    me.consumerBlockers.join(', ')
+                );
+            } else if (moveBlocked) {
+                message = Ext.String.format(
+                    gettext('Stop and unlock current VM {0} before moving the whole GPU to another VM.'),
+                    me.currentPfVmid
+                );
+            }
+            blocker.setHtml(message ? '<i class="fa fa-ban"></i> ' + Ext.htmlEncode(message) : '');
+            blocker.setVisible(!!message);
+        }
+    },
+
+    confirmAndSubmit: function() {
+        var me = this;
+        var targetVmid = Number(me.down('#vmField').getValue()) || 0;
+        var sameTarget = !!me.currentPfVmid && targetVmid === me.currentPfVmid;
+        var sourceStopped = !me.currentPfVmid || (me.currentPfVm &&
+            me.currentPfVm.status === 'stopped' && !me.currentPfVm.lock);
+        if (!targetVmid || me.consumerBlockers.length > 0 ||
+            (me.currentPfVmid && !sameTarget && !sourceStopped)) { return; }
+
+        var message = sameTarget ? Ext.String.format(
+            gettext('Verify the whole-GPU assignment to VM {0}? A fully consistent state is left unchanged; stop the VM first if repair is required.'),
+            Ext.htmlEncode(String(targetVmid))
+        ) : Ext.String.format(
+                gettext('Detach {0} VF assignment(s), delete {1} VF(s), bind {2} to vfio-pci, and assign the whole GPU to VM {3}?'),
+                me.assignments.length,
+                me.currentNumVfs,
+                Ext.htmlEncode(me.currentBdf),
+                Ext.htmlEncode(String(targetVmid))
+            ) + '<br><br>' + Ext.htmlEncode(
+                gettext('Only this GPU PF and its VFs are changed. Separate audio or other PCI devices are not moved automatically.')
+            );
+        Ext.Msg.confirm(gettext('Confirm whole-GPU passthrough'), message, function(answer) {
+            if (answer === 'yes') {
+                me.submit(targetVmid);
+            }
+        });
+    },
+
+    submit: function(targetVmid) {
+        var me = this;
+        var nodeName = me.nodeName();
+        var bdf = me.currentBdf;
+        var sameTarget = !!me.currentPfVmid && targetVmid === me.currentPfVmid;
+        var sourceStopped = !me.currentPfVmid || (me.currentPfVm &&
+            me.currentPfVm.status === 'stopped' && !me.currentPfVm.lock);
+        if (!nodeName || !bdf || !targetVmid || me.consumerBlockers.length > 0 ||
+            (me.currentPfVmid && !sameTarget && !sourceStopped)) {
+            return;
+        }
+        var requestId = ++me.transactionRequestId;
+
+        me.setLoading(true);
+        Proxmox.Utils.API2Request({
+            url: '/nodes/' + encodeURIComponent(nodeName) +
+                '/hardware/gpu/' + encodeURIComponent(bdf) +
+                '/passthrough',
+            method: 'POST',
+            params: { vmid: targetVmid },
+            success: function(response) {
+                if (requestId !== me.transactionRequestId || me.currentBdf !== bdf ||
+                    me.destroyed || me.isDestroyed) {
+                    return;
+                }
+                var data = response.result && response.result.data;
+                me.setLoading(false);
+                me.fireEvent('wholepassthroughchanged', me, bdf, data);
+                me.close();
+            },
+            failure: function(response, opts, error) {
+                if (requestId !== me.transactionRequestId || me.currentBdf !== bdf ||
+                    me.destroyed || me.isDestroyed) {
+                    return;
+                }
+                me.setLoading(false);
+                me.updateState();
+                Ext.Msg.alert(gettext('Error'), error || response.htmlStatus);
+            }
+        });
+    }
+});
+
+/* =========================================================================
+ * GpuPowerPolicyDialog — runtime-only B50 deep idle
+ * ========================================================================= */
+
+Ext.define('PVE.window.GpuPowerPolicyDialog', {
+    extend: 'Ext.window.Window',
+    alias: 'widget.gpuPowerPolicyDialog',
+
+    modal: true,
+    width: 760,
+    minHeight: 420,
+    layout: 'fit',
+    closeAction: 'destroy',
+
+    config: {
+        pveSelNode: null,
+        deviceRecord: null
+    },
+
+    initComponent: function() {
+        var me = this;
+        var record = me.deviceRecord;
+        var bdf = record ? record.get('bdf') : null;
+        me.currentBdf = bdf;
+        me.policy = null;
+        me.policyRequestId = 0;
+        me.actionRequestId = 0;
+        me.actionInFlight = false;
+        me.title = bdf ? Ext.String.format(
+            gettext('Power Saving: {0}'),
+            bdf
+        ) : gettext('Power Saving');
+
+        me.items = [
+            {
+                xtype: 'panel',
+                border: false,
+                bodyPadding: 12,
+                scrollable: 'y',
+                layout: { type: 'vbox', align: 'stretch' },
+                items: [
+                    {
+                        xtype: 'component',
+                        itemId: 'powerSummary',
+                        html: ''
+                    },
+                    {
+                        xtype: 'component',
+                        itemId: 'powerBlockers',
+                        margin: '10 0 0 0',
+                        hidden: true,
+                        html: ''
+                    },
+                    {
+                        xtype: 'component',
+                        itemId: 'powerNote',
+                        margin: '10 0 0 0',
+                        padding: 9,
+                        style: 'background:#f7f7f7;border:1px solid #ddd;color:#555;',
+                        html: Ext.htmlEncode(gettext(
+                            'This mode is runtime-only. A host reboot clears it and the normal persistent VF restore runs before guests start.'
+                        ))
+                    }
+                ]
+            }
+        ];
+
+        me.buttons = [
+            {
+                itemId: 'powerActionBtn',
+                text: gettext('Enter Power Saving'),
+                iconCls: 'fa fa-leaf',
+                disabled: true,
+                handler: function() { me.confirmAction(); }
+            },
+            {
+                text: gettext('Close'),
+                handler: function() { me.close(); }
+            }
+        ];
+
+        me.callParent();
+        me.on('destroy', function() {
+            me.policyRequestId++;
+            me.actionRequestId++;
+        });
+        me.updateView();
+        me.reloadPolicy();
+    },
+
+    nodeName: function() {
+        return this.pveSelNode && this.pveSelNode.data ?
+            this.pveSelNode.data.node : undefined;
+    },
+
+    isCurrent: function(bdf, requestId, action) {
+        return this.currentBdf === bdf &&
+            requestId === (action ? this.actionRequestId : this.policyRequestId) &&
+            !this.destroyed && !this.isDestroyed;
+    },
+
+    reloadPolicy: function() {
+        var me = this;
+        var nodeName = me.nodeName();
+        var bdf = me.currentBdf;
+        if (!nodeName || !bdf) {
+            return;
+        }
+        var requestId = ++me.policyRequestId;
+        me.setLoading(true);
+        Proxmox.Utils.API2Request({
+            url: '/nodes/' + encodeURIComponent(nodeName) +
+                '/hardware/gpu/' + encodeURIComponent(bdf) + '/power-policy',
+            method: 'GET',
+            success: function(response) {
+                if (!me.isCurrent(bdf, requestId, false)) {
+                    return;
+                }
+                me.setLoading(false);
+                me.policy = (response.result && response.result.data) || null;
+                me.updateView();
+            },
+            failure: function(response, opts, error) {
+                if (!me.isCurrent(bdf, requestId, false)) {
+                    return;
+                }
+                me.setLoading(false);
+                me.policy = null;
+                me.updateView();
+                Ext.Msg.alert(gettext('Error'), error || response.htmlStatus);
+            }
+        });
+    },
+
+    updateView: function() {
+        var me = this;
+        var policy = me.policy;
+        var summary = me.down('#powerSummary');
+        var blockers = me.down('#powerBlockers');
+        var action = me.down('#powerActionBtn');
+        if (!summary || !blockers || !action) {
+            return;
+        }
+        if (!policy) {
+            summary.setHtml('<span style="color:#777;">' +
+                Ext.htmlEncode(gettext('Power policy status is unavailable.')) + '</span>');
+            blockers.setVisible(false);
+            action.setDisabled(true);
+            return;
+        }
+
+        var mode = policy.mode || 'unknown';
+        var deep = mode !== 'normal';
+        var modeText = mode === 'normal' ? gettext('Normal') :
+            (mode === 'deep-idle' ? gettext('Deep idle') : mode);
+        var runtimeText = policy.runtime_status || gettext('Unknown');
+        var pciText = policy.pci_power_state || gettext('Unknown');
+        var profileText = gpuAtsBoolean(policy.persistent_profile) ?
+            gettext('Verified') : gettext('Not available');
+        var telemetryText = deep ?
+            gettext('Paused to avoid waking the GPU') : gettext('Active');
+        var modeColour = deep ? '#2673b8' : '#444';
+        var summaryHtml = '<div style="border:1px solid #ddd;background:#f7f7f7;padding:10px;">' +
+            '<div style="font-size:16px;font-weight:bold;color:' + modeColour + ';margin-bottom:8px;">' +
+            Ext.htmlEncode(modeText) + '</div>' +
+            '<table style="width:100%;border-collapse:collapse;line-height:1.8;">' +
+            '<tr><td style="width:210px;color:#666;">' + Ext.htmlEncode(gettext('PF driver')) + '</td><td>' +
+            Ext.htmlEncode(policy.driver || gettext('Unbound')) + '</td></tr>' +
+            '<tr><td style="color:#666;">' + Ext.htmlEncode(gettext('Active VFs')) + '</td><td>' +
+            Ext.htmlEncode(String(policy.active_vfs)) +
+            (deep ? ' (' + Ext.htmlEncode(Ext.String.format(
+                gettext('{0} VF profile(s) retained'),
+                policy.saved_vfs || 0
+            )) + ')' : '') + '</td></tr>' +
+            '<tr><td style="color:#666;">' + Ext.htmlEncode(gettext('Persistent VF profile')) + '</td><td>' +
+            Ext.htmlEncode(profileText) + '</td></tr>' +
+            '<tr><td style="color:#666;">' + Ext.htmlEncode(gettext('Autosuspend')) + '</td><td>' +
+            Ext.htmlEncode(policy.autosuspend_delay_ms === null ||
+                policy.autosuspend_delay_ms === undefined ? '-' :
+                String(policy.autosuspend_delay_ms) + ' ms') + '</td></tr>' +
+            '<tr><td style="color:#666;">' + Ext.htmlEncode(gettext('Runtime / PCI power')) + '</td><td>' +
+            Ext.htmlEncode(runtimeText + ' / ' + pciText) + '</td></tr>' +
+            '<tr><td style="color:#666;">' + Ext.htmlEncode(gettext('Telemetry')) + '</td><td>' +
+            Ext.htmlEncode(telemetryText) + '</td></tr>' +
+            '</table></div>';
+        summary.setHtml(summaryHtml);
+
+        var list = Ext.isArray(policy.blockers) ? policy.blockers : [];
+        var blockerHtml = '';
+        if (!deep && list.length) {
+            blockerHtml = '<div style="background:#fff3cd;border:1px solid #e0ae38;color:#5d4600;padding:9px;">' +
+                '<strong>' + Ext.htmlEncode(gettext('Cannot enter power saving')) + '</strong><ul style="margin:6px 0 0 20px;">';
+            Ext.Array.each(list, function(item) {
+                blockerHtml += '<li>' + Ext.htmlEncode(String(item.detail || item.code || '')) + '</li>';
+            });
+            blockerHtml += '</ul></div>';
+        } else if (deep && !gpuAtsBoolean(policy.can_exit)) {
+            var exitIssues = [];
+            Ext.Array.each(list, function(item) {
+                var detail = String(item.detail || item.code || '');
+                if (detail) {
+                    exitIssues.push(detail);
+                }
+            });
+            if (policy.profile_error) {
+                exitIssues.push(String(policy.profile_error));
+            }
+            if (!exitIssues.length) {
+                exitIssues.push(gettext('The retained recovery state is unavailable or invalid.'));
+            }
+            blockerHtml = '<div style="background:#fde2e2;border:1px solid #d66;color:#7a1d1d;padding:9px;">' +
+                '<strong>' + Ext.htmlEncode(gettext('Cannot restore the GPU automatically')) + '</strong>' +
+                '<ul style="margin:6px 0 0 20px;">';
+            Ext.Array.each(exitIssues, function(detail) {
+                blockerHtml += '<li>' + Ext.htmlEncode(detail) + '</li>';
+            });
+            blockerHtml += '</ul></div>';
+        } else if (deep && !gpuAtsBoolean(policy.sleeping)) {
+            blockerHtml = '<div style="background:#fff3cd;border:1px solid #e0ae38;color:#5d4600;padding:9px;">' +
+                Ext.htmlEncode(gettext('The VF topology is parked, but the PF is not currently suspended. Another process may still be polling the GPU.')) +
+                '</div>';
+        }
+        blockers.setHtml(blockerHtml);
+        blockers.setVisible(!!blockerHtml);
+
+        action.setText(deep ? gettext('Exit Power Saving') : gettext('Enter Power Saving'));
+        action.setIconCls(deep ? 'fa fa-undo' : 'fa fa-leaf');
+        action.setDisabled(me.actionInFlight ||
+            !(deep ? gpuAtsBoolean(policy.can_exit) : gpuAtsBoolean(policy.can_enter)));
+    },
+
+    confirmAction: function() {
+        var me = this;
+        if (!me.policy || me.actionInFlight) {
+            return;
+        }
+        var deep = me.policy.mode !== 'normal';
+        var title = deep ? gettext('Exit Power Saving') : gettext('Enter Power Saving');
+        var message = deep ?
+            gettext('Restore the retained VF topology, resource profiles, drivers, and normal autosuspend settings now?') :
+            gettext('Temporarily remove all VFs and set the B50 autosuspend delay to 10 ms? VM hostpci entries and the persistent VF profile are retained. Telemetry is paused, and a reboot returns to normal mode.');
+        Ext.Msg.confirm(title, message, function(answer) {
+            if (answer === 'yes') {
+                me.runAction(deep ? 'exit' : 'enter');
+            }
+        });
+    },
+
+    runAction: function(actionName) {
+        var me = this;
+        var nodeName = me.nodeName();
+        var bdf = me.currentBdf;
+        if (!nodeName || !bdf || me.actionInFlight) {
+            return;
+        }
+        var requestId = ++me.actionRequestId;
+        me.actionInFlight = true;
+        me.updateView();
+        me.setLoading(true);
+        Proxmox.Utils.API2Request({
+            url: '/nodes/' + encodeURIComponent(nodeName) +
+                '/hardware/gpu/' + encodeURIComponent(bdf) + '/power-policy',
+            method: 'POST',
+            params: { action: actionName },
+            success: function(response) {
+                if (!me.isCurrent(bdf, requestId, true)) {
+                    return;
+                }
+                me.setLoading(false);
+                me.actionInFlight = false;
+                me.policy = (response.result && response.result.data) || null;
+                me.updateView();
+                me.fireEvent('powerpolicychange', me, bdf, me.policy);
+                Ext.toast(actionName === 'enter' ?
+                    gettext('B50 entered runtime power saving.') :
+                    gettext('B50 VF topology restored.'));
+            },
+            failure: function(response, opts, error) {
+                if (!me.isCurrent(bdf, requestId, true)) {
+                    return;
+                }
+                me.setLoading(false);
+                me.actionInFlight = false;
+                me.updateView();
+                Ext.Msg.alert(gettext('Error'), error || response.htmlStatus);
+            }
+        });
+    }
+});
+
+/* =========================================================================
+ * GpuAtsPolicyPanel — ATS state and the host-wide pci=noats policy
+ * ========================================================================= */
+
+Ext.define('PVE.panel.GpuAtsPolicyPanel', {
+    extend: 'Ext.panel.Panel',
+    alias: 'widget.gpuAtsPolicyPanel',
+
+    title: gettext('ATS Safety Policy'),
+    bodyPadding: 8,
+    layout: { type: 'vbox', align: 'stretch' },
+    border: true,
+
+    config: {
+        pveSelNode: null,
+        deviceRecord: null
+    },
+
+    initComponent: function() {
+        var me = this;
+
+        me.currentBdf = null;
+        me.atsPolicy = null;
+        me.policyRequestId = 0;
+        me.actionRequestId = 0;
+        me.actionInFlight = false;
+
+        me.items = [
+            {
+                xtype: 'container',
+                itemId: 'atsStates',
+                layout: { type: 'hbox', align: 'stretch' },
+                defaults: {
+                    xtype: 'component',
+                    flex: 1,
+                    margin: '0 8 0 0',
+                    padding: 6,
+                    style: 'border:1px solid #ddd;background:#f7f7f7;'
+                },
+                items: [
+                    { itemId: 'activeState', html: '' },
+                    { itemId: 'persistentState', html: '' },
+                    { itemId: 'atsState', html: '' },
+                    { itemId: 'managedState', html: '' }
+                ]
+            },
+            {
+                xtype: 'component',
+                itemId: 'policyNote',
+                margin: '8 0 0 0',
+                padding: 7,
+                hidden: true,
+                style: 'color:#555;background:#f7f7f7;border:1px solid #ddd;',
+                html: ''
+            },
+            {
+                xtype: 'component',
+                itemId: 'riskArea',
+                margin: '8 0 0 0',
+                hidden: true,
+                html: ''
+            },
+            {
+                xtype: 'container',
+                itemId: 'atsActions',
+                layout: { type: 'hbox', align: 'middle' },
+                margin: '8 0 0 0',
+                items: [
+                    {
+                        xtype: 'button',
+                        itemId: 'prepareNoatsBtn',
+                        text: gettext('Prepare pci=noats'),
+                        iconCls: 'fa fa-warning',
+                        hidden: true,
+                        handler: function() { me.confirmPrepareNoats(); }
+                    },
+                    {
+                        xtype: 'button',
+                        itemId: 'removeManagedNoatsBtn',
+                        text: gettext('Remove managed pci=noats'),
+                        iconCls: 'fa fa-trash',
+                        hidden: true,
+                        margin: '0 0 0 8',
+                        handler: function() { me.confirmRemoveManagedNoats(); }
+                    }
+                ]
+            }
+        ];
+
+        me.callParent();
+        me.updatePolicyView();
+        me.on('destroy', function() {
+            me.policyRequestId++;
+            me.actionRequestId++;
+        });
+    },
+
+    nodeName: function() {
+        return this.pveSelNode && this.pveSelNode.data ?
+            this.pveSelNode.data.node : undefined;
+    },
+
+    isCurrentPolicy: function(bdf, requestId) {
+        return requestId === this.policyRequestId &&
+            this.currentBdf === bdf &&
+            !this.destroyed && !this.isDestroyed;
+    },
+
+    isPolicyComplete: function() {
+        return gpuAtsPolicyComplete(this.atsPolicy) && !!this.currentBdf;
+    },
+
+    loadDevice: function(deviceRecord) {
+        var me = this;
+        var oldBdf = me.currentBdf;
+        me.policyRequestId++;
+        me.actionRequestId++;
+        me.actionInFlight = false;
+        me.setLoading(false);
+        me.deviceRecord = deviceRecord;
+        me.currentBdf = deviceRecord ? deviceRecord.get('bdf') : null;
+        me.atsPolicy = null;
+        me.updatePolicyView();
+        if (!deviceRecord || !me.currentBdf) {
+            if (oldBdf) {
+                me.fireEvent('atspolicychange', me, oldBdf, null);
+            }
+            return;
+        }
+        me.reloadPolicy(me.currentBdf);
+    },
+
+    reloadPolicy: function(expectedBdf) {
+        var me = this;
+        var nodeName = me.nodeName();
+        var bdf = expectedBdf || me.currentBdf;
+        if (!nodeName || !bdf || me.currentBdf !== bdf) {
+            return;
+        }
+        var requestId = ++me.policyRequestId;
+
+        Proxmox.Utils.API2Request({
+            url: '/nodes/' + encodeURIComponent(nodeName) +
+                '/hardware/gpu/' + encodeURIComponent(bdf) + '/ats-policy',
+            method: 'GET',
+            success: function(response) {
+                if (!me.isCurrentPolicy(bdf, requestId)) {
+                    return;
+                }
+                var data = response.result && response.result.data;
+                me.atsPolicy = data || null;
+                me.updatePolicyView();
+                me.fireEvent('atspolicychange', me, bdf, me.atsPolicy);
+            },
+            failure: function(response, opts, error) {
+                if (!me.isCurrentPolicy(bdf, requestId)) {
+                    return;
+                }
+                // An unavailable or malformed policy must leave the whole-GPU
+                // action disabled.  Preserve the server's exact error text.
+                me.atsPolicy = null;
+                me.updatePolicyView();
+                me.fireEvent('atspolicychange', me, bdf, null);
+                Ext.Msg.alert(gettext('Error'), error || response.htmlStatus);
+            }
+        });
+    },
+
+    policyText: function(value, yesText, noText) {
+        if (!this.isPolicyComplete()) {
+            return gettext('Unknown');
+        }
+        return gpuAtsBoolean(value) ? yesText : noText;
+    },
+
+    updatePolicyView: function() {
+        var me = this;
+        var known = me.isPolicyComplete();
+        var policy = me.atsPolicy || {};
+        var active = me.down('#activeState');
+        var persistent = me.down('#persistentState');
+        var ats = me.down('#atsState');
+        var managed = me.down('#managedState');
+        var note = me.down('#policyNote');
+        var risk = me.down('#riskArea');
+        var prepare = me.down('#prepareNoatsBtn');
+        var remove = me.down('#removeManagedNoatsBtn');
+
+        if (active) {
+            active.setHtml('<strong>' + Ext.htmlEncode(gettext('Active:')) +
+                '</strong> ' + Ext.htmlEncode(me.policyText(
+                    policy.active_noats,
+                    gettext('pci=noats'),
+                    gettext('ATS default')
+                )));
+        }
+        if (persistent) {
+            persistent.setHtml('<strong>' + Ext.htmlEncode(gettext('Persistent:')) +
+                '</strong> ' + Ext.htmlEncode(me.policyText(
+                    policy.persistent_noats,
+                    gettext('pci=noats'),
+                    gettext('Not set')
+                )));
+        }
+        if (ats) {
+            var atsText = !known ? gettext('Unknown') :
+                (!gpuAtsBoolean(policy.ats_supported) ? gettext('Not supported') :
+                    (gpuAtsBoolean(policy.ats_enabled) ? gettext('Enabled') : gettext('Disabled')));
+            ats.setHtml('<strong>' + Ext.htmlEncode(gettext('ATS:')) +
+                '</strong> ' + Ext.htmlEncode(atsText));
+        }
+        if (managed) {
+            managed.setHtml('<strong>' + Ext.htmlEncode(gettext('Managed:')) +
+                '</strong> ' + Ext.htmlEncode(me.policyText(
+                    policy.managed,
+                    gettext('Yes'),
+                    gettext('No')
+                )));
+        }
+
+        var noteLines = [];
+        if (!known) {
+            noteLines.push(gettext('ATS policy status is unknown. Quick Whole-GPU Passthrough remains disabled until this BDF is verified.'));
+        } else {
+            if (policy.reason) {
+                noteLines.push(Ext.htmlEncode(String(policy.reason)));
+            }
+            if (gpuAtsBoolean(policy.reboot_required)) {
+                noteLines.push(Ext.htmlEncode(gettext('A host reboot is required; this UI never reboots automatically.')));
+            }
+            if (gpuAtsBoolean(policy.persistent_noats) &&
+                !gpuAtsBoolean(policy.managed)) {
+                noteLines.push(Ext.htmlEncode(gettext('Persistent pci=noats is present but is not managed by this plugin.')));
+            }
+            if (gpuAtsBoolean(policy.persistent_noats) &&
+                gpuAtsBoolean(policy.managed)) {
+                noteLines.push(Ext.htmlEncode(gettext('Remove managed pci=noats only after releasing the whole GPU/VFIO assignment; ATS is restored only after a host reboot. 须先解除整卡/VFIO，且重启后才恢复 ATS。')));
+            }
+        }
+        if (note) {
+            note.setHtml(noteLines.join('<br>'));
+            note.setVisible(noteLines.length > 0);
+        }
+
+        var riskHtml = '';
+        if (!known) {
+            riskHtml = '<div style="background:#fff3cd;border:1px solid #e0ae38;color:#5d4600;padding:8px;">' +
+                '<strong>' + Ext.htmlEncode(gettext('Safety state unavailable')) + '</strong><br>' +
+                Ext.htmlEncode(gettext('The safety gate is fail-closed. Use the native status view for read-only verification.')) +
+                '</div>';
+        } else if (gpuAtsBoolean(policy.affected) &&
+                   !gpuAtsBoolean(policy.safe)) {
+            riskHtml = '<div style="background:#fde2e2;border:1px solid #d66;color:#7a1d1d;padding:8px;">' +
+                '<strong>' + Ext.htmlEncode(gettext('ATS unsafe for Quick Whole-GPU writes')) + '</strong><br>' +
+                Ext.htmlEncode(gettext('Field evidence: IOTLB_INV_TIMEOUT / host hard reset was reproduced twice (现场已复现两次 IOTLB_INV_TIMEOUT/宿主硬复位)。')) +
+                '</div>' +
+                '<div style="background:#fff3cd;border:1px solid #e0ae38;color:#5d4600;padding:8px;margin-top:6px;">' +
+                '<strong>' + Ext.htmlEncode(gettext('Global pci=noats impact')) + '</strong><br>' +
+                Ext.htmlEncode(gettext('pci=noats is a global host boot option and affects every PCI device, not only this GPU (全局 pci=noats 会影响整台宿主)。')) +
+                '</div>' +
+                '<div style="background:#fff3cd;border:1px solid #e0ae38;color:#5d4600;padding:8px;margin-top:6px;">' +
+                Ext.htmlEncode(gettext('If this GPU is already the whole-GPU owner, use the native status view for read-only verification; no repair write is allowed while ATS is unsafe.')) +
+                '</div>';
+        }
+        if (risk) {
+            risk.setHtml(riskHtml);
+            risk.setVisible(!!riskHtml);
+        }
+
+        var affected = known && gpuAtsBoolean(policy.affected);
+        var canPrepare = affected && !gpuAtsBoolean(policy.persistent_noats) &&
+            !me.actionInFlight;
+        var canRemove = affected && gpuAtsBoolean(policy.persistent_noats) &&
+            gpuAtsBoolean(policy.managed) && !me.actionInFlight;
+        if (prepare) {
+            prepare.setVisible(affected && !gpuAtsBoolean(policy.persistent_noats));
+            prepare.setDisabled(!canPrepare);
+            prepare.setTooltip(gettext('Prepare the global pci=noats boot policy; reboot the host manually for it to take effect.'));
+        }
+        if (remove) {
+            remove.setVisible(canRemove || (affected &&
+                gpuAtsBoolean(policy.persistent_noats) && gpuAtsBoolean(policy.managed)));
+            remove.setDisabled(!canRemove);
+            remove.setTooltip(gettext('Release the whole GPU/VFIO assignment first; ATS returns only after a host reboot.'));
+        }
+    },
+
+    confirmPrepareNoats: function() {
+        var me = this;
+        if (!me.isPolicyComplete() || !gpuAtsBoolean(me.atsPolicy.affected) ||
+            gpuAtsBoolean(me.atsPolicy.persistent_noats) ||
+            me.actionInFlight) {
+            return;
+        }
+        Ext.Msg.confirm(
+            gettext('Prepare pci=noats'),
+            gettext('Prepare the global pci=noats boot option? It affects every PCI device, requires a host reboot, and this UI will never reboot the host automatically.'),
+            function(answer) {
+                if (answer === 'yes') {
+                    me.prepareNoats();
+                }
+            }
+        );
+    },
+
+    prepareNoats: function() {
+        var me = this;
+        var nodeName = me.nodeName();
+        var bdf = me.currentBdf;
+        if (!nodeName || !bdf || !me.isPolicyComplete() ||
+            !gpuAtsBoolean(me.atsPolicy.affected) ||
+            gpuAtsBoolean(me.atsPolicy.persistent_noats) || me.actionInFlight) {
+            return;
+        }
+        var requestId = ++me.actionRequestId;
+        me.actionInFlight = true;
+        me.updatePolicyView();
+        // Keep the whole-GPU action fail-closed while the host policy write is
+        // in flight.  The old policy remains locally available for recovery
+        // if the request fails.
+        me.fireEvent('atspolicychange', me, bdf, null);
+        me.setLoading(true);
+        Proxmox.Utils.API2Request({
+            url: '/nodes/' + encodeURIComponent(nodeName) +
+                '/hardware/gpu/' + encodeURIComponent(bdf) + '/ats-policy',
+            method: 'POST',
+            success: function() {
+                if (requestId !== me.actionRequestId || me.currentBdf !== bdf ||
+                    me.destroyed || me.isDestroyed) {
+                    return;
+                }
+                me.setLoading(false);
+                me.actionInFlight = false;
+                Ext.toast(gettext('已准备，重启宿主后生效'));
+                // Refresh only this BDF's ATS policy.  Do not reload the
+                // device list or trigger an automatic reboot.
+                me.atsPolicy = null;
+                me.updatePolicyView();
+                me.reloadPolicy(bdf);
+            },
+            failure: function(response, opts, error) {
+                if (requestId !== me.actionRequestId || me.currentBdf !== bdf ||
+                    me.destroyed || me.isDestroyed) {
+                    return;
+                }
+                me.setLoading(false);
+                me.actionInFlight = false;
+                me.updatePolicyView();
+                me.fireEvent('atspolicychange', me, bdf, me.atsPolicy);
+                Ext.Msg.alert(gettext('Error'), error || response.htmlStatus);
+            }
+        });
+    },
+
+    confirmRemoveManagedNoats: function() {
+        var me = this;
+        if (!me.isPolicyComplete() || !gpuAtsBoolean(me.atsPolicy.affected) ||
+            !gpuAtsBoolean(me.atsPolicy.persistent_noats) ||
+            !gpuAtsBoolean(me.atsPolicy.managed) || me.actionInFlight) {
+            return;
+        }
+        Ext.Msg.confirm(
+            gettext('Remove managed pci=noats'),
+            gettext('Release the whole GPU/VFIO assignment first, then remove managed pci=noats? ATS is restored only after the host reboots. 须先解除整卡/VFIO且重启后才恢复 ATS。'),
+            function(answer) {
+                if (answer === 'yes') {
+                    me.removeManagedNoats();
+                }
+            }
+        );
+    },
+
+    removeManagedNoats: function() {
+        var me = this;
+        var nodeName = me.nodeName();
+        var bdf = me.currentBdf;
+        if (!nodeName || !bdf || !me.isPolicyComplete() ||
+            !gpuAtsBoolean(me.atsPolicy.affected) ||
+            !gpuAtsBoolean(me.atsPolicy.persistent_noats) ||
+            !gpuAtsBoolean(me.atsPolicy.managed) || me.actionInFlight) {
+            return;
+        }
+        var requestId = ++me.actionRequestId;
+        me.actionInFlight = true;
+        me.updatePolicyView();
+        me.fireEvent('atspolicychange', me, bdf, null);
+        me.setLoading(true);
+        Proxmox.Utils.API2Request({
+            url: '/nodes/' + encodeURIComponent(nodeName) +
+                '/hardware/gpu/' + encodeURIComponent(bdf) + '/ats-policy',
+            method: 'DELETE',
+            success: function() {
+                if (requestId !== me.actionRequestId || me.currentBdf !== bdf ||
+                    me.destroyed || me.isDestroyed) {
+                    return;
+                }
+                me.setLoading(false);
+                me.actionInFlight = false;
+                Ext.toast(gettext('Managed pci=noats removed; reboot the host to restore ATS.'));
+                me.atsPolicy = null;
+                me.updatePolicyView();
+                me.reloadPolicy(bdf);
+            },
+            failure: function(response, opts, error) {
+                if (requestId !== me.actionRequestId || me.currentBdf !== bdf ||
+                    me.destroyed || me.isDestroyed) {
+                    return;
+                }
+                me.setLoading(false);
+                me.actionInFlight = false;
+                me.updatePolicyView();
+                me.fireEvent('atspolicychange', me, bdf, me.atsPolicy);
+                Ext.Msg.alert(gettext('Error'), error || response.htmlStatus);
+            }
+        });
+    }
+});
+
+/* =========================================================================
+ * GpuAtsPolicyDialog — on-demand ATS policy and host-wide controls
+ * ========================================================================= */
+
+Ext.define('PVE.window.GpuAtsPolicyDialog', {
+    extend: 'Ext.window.Window',
+    alias: 'widget.gpuAtsPolicyDialog',
+
+    modal: true,
+    width: 1000,
+    height: 460,
+    layout: 'fit',
+    closeAction: 'destroy',
+
+    config: {
+        pveSelNode: null,
+        deviceRecord: null
+    },
+
+    initComponent: function() {
+        var me = this;
+        var record = me.deviceRecord;
+        me.title = record ? Ext.String.format(
+            gettext('ATS Safety Policy: {0}'),
+            record.get('bdf')
+        ) : gettext('ATS Safety Policy');
+        me.items = [
+            {
+                xtype: 'gpuAtsPolicyPanel',
+                itemId: 'atsPolicyPanel',
+                title: null,
+                header: false,
+                border: false,
+                scrollable: 'y',
+                pveSelNode: me.pveSelNode
+            }
+        ];
+        me.buttons = [
+            {
+                text: gettext('Close'),
+                handler: function() { me.close(); }
+            }
+        ];
+
+        me.callParent();
+        me.down('#atsPolicyPanel').on('atspolicychange', function(panel, bdf, policy) {
+            me.fireEvent('atspolicychange', me, bdf, policy);
+        });
+        me.down('#atsPolicyPanel').loadDevice(record);
+    }
+});
+
+/* =========================================================================
  * GpuSriovPanel — VF management section (precheck + VF grid)
  * ========================================================================= */
 
@@ -2371,6 +3664,10 @@ Ext.define('PVE.panel.GpuSriovPanel', {
         me.vfDataLoaded = false;
         me.sriovRequestId = 0;
         me.vfRequestId = 0;
+        // Whole-GPU writes are gated by the separately loaded ATS policy.
+        // Ordinary VF inspection and assignment do not use this gate.
+        me.atsPolicy = null;
+        me.atsPolicyBdf = null;
 
         me.items = [
             // Drift banner
@@ -2398,6 +3695,11 @@ Ext.define('PVE.panel.GpuSriovPanel', {
                 xtype: 'gridpanel',
                 itemId: 'vfGrid',
                 flex: 1,
+                minHeight: 180,
+                // Keep VF column sizing separate from the physical-device
+                // table while using PVE's browser-local state provider.
+                stateful: true,
+                stateId: 'grid-pve-gpu-vfs-v1',
                 store: { type: 'gpuVfs' },
                 columns: [
                     { header: gettext('VF #'), dataIndex: 'vf_index', width: 60, align: 'center' },
@@ -2408,7 +3710,7 @@ Ext.define('PVE.panel.GpuSriovPanel', {
                         }
                     },
                     {
-                        header: gettext('VRAM'), dataIndex: 'resources', width: 155,
+                        header: gettext('LMEM'), dataIndex: 'resources', width: 155,
                         renderer: gpuVfResourceRenderer('vram')
                     },
                     {
@@ -2472,6 +3774,14 @@ Ext.define('PVE.panel.GpuSriovPanel', {
                         iconCls: 'fa fa-sliders',
                         disabled: true,
                         handler: function() { me.openModifyDialog(); }
+                    },
+                    {
+                        xtype: 'button',
+                        itemId: 'wholeGpuBtn',
+                        text: gettext('Quick Whole-GPU Passthrough'),
+                        iconCls: 'fa fa-exchange',
+                        disabled: true,
+                        handler: function() { me.openWholeGpuDialog(); }
                     }
                 ]
             }
@@ -2489,12 +3799,15 @@ Ext.define('PVE.panel.GpuSriovPanel', {
         me.deviceRecord = deviceRecord;
         me.sriovStatus = null;
         me.vfDataLoaded = false;
+        me.atsPolicy = null;
+        me.atsPolicyBdf = null;
         me.sriovRequestId++;
         me.vfRequestId++;
 
         var vfGrid = me.down('#vfGrid');
         vfGrid.getStore().removeAll();
         me.down('#modifyVfsBtn').setDisabled(true);
+        me.down('#wholeGpuBtn').setDisabled(true);
         me.down('#driftBanner').hide();
         me.down('#precheckBar').loadPrechecks(null);
         me.down('#precheckBar').show();
@@ -2518,8 +3831,13 @@ Ext.define('PVE.panel.GpuSriovPanel', {
             me.enable();
             me.setTitle(gettext('SR-IOV Virtual Functions') + ' \u2014 ' +
                 Ext.String.format(gettext('GPU assigned to VM {0}'), pfVmid || '?'));
+            me.down('#schedulerStatus').setHtml(
+                '<strong>' + Ext.htmlEncode(gettext('Device scheduler')) + ':</strong> ' +
+                Ext.htmlEncode(gettext('Unavailable while the PF is bound to vfio-pci'))
+            );
             me.down('#precheckBar').hide();
             me.down('#modifyVfsBtn').setDisabled(true);
+            me.updateWholeGpuButton();
             me.reloadVfs();
             return;
         }
@@ -2598,6 +3916,7 @@ Ext.define('PVE.panel.GpuSriovPanel', {
                 }
 
                 me.updateModifyButton();
+                me.updateWholeGpuButton();
             },
             failure: function(response, opts, error) {
                 if (requestId !== me.sriovRequestId || !me.isCurrentDevice(bdf)) {
@@ -2634,6 +3953,7 @@ Ext.define('PVE.panel.GpuSriovPanel', {
                 }
                 me.vfDataLoaded = true;
                 me.updateModifyButton();
+                me.updateWholeGpuButton();
             },
             failure: function() {
                 if (requestId !== me.vfRequestId || !me.isCurrentDevice(bdf)) {
@@ -2643,12 +3963,30 @@ Ext.define('PVE.panel.GpuSriovPanel', {
                 store.removeAll();
                 me.vfDataLoaded = false;
                 me.updateModifyButton();
+                me.updateWholeGpuButton();
             }
         });
     },
 
     isCurrentDevice: function(bdf) {
         return !!this.deviceRecord && this.deviceRecord.get('bdf') === bdf;
+    },
+
+    setAtsPolicy: function(policy, bdf) {
+        var me = this;
+        if (!bdf || !me.isCurrentDevice(bdf)) {
+            return;
+        }
+        me.atsPolicy = policy;
+        me.atsPolicyBdf = bdf;
+        me.updateWholeGpuButton();
+    },
+
+    isAtsPolicyKnown: function() {
+        var me = this;
+        var bdf = me.deviceRecord ? me.deviceRecord.get('bdf') : null;
+        return !!bdf && me.atsPolicyBdf === bdf &&
+            gpuAtsPolicyComplete(me.atsPolicy);
     },
 
     updateModifyButton: function() {
@@ -2675,6 +4013,46 @@ Ext.define('PVE.panel.GpuSriovPanel', {
             var blocked = status.change_blocked || {};
             button.setTooltip(blocked.resources ?
                 gettext('A consumer VM is running. You may inspect profiles, but Apply remains disabled until it is stopped.') : '');
+        }
+    },
+
+    updateWholeGpuButton: function() {
+        var me = this;
+        var button = me.down('#wholeGpuBtn');
+        if (!button || !me.deviceRecord) { return; }
+        var status = me.sriovStatus;
+        var pfAssigned = !!me.deviceRecord.get('pf_assigned');
+        var pfVmid = me.deviceRecord.get('pf_vmid');
+        var assignments = status && Ext.isArray(status.assignments) ?
+            status.assignments : [];
+        var running = Ext.Array.filter(assignments, function(assignment) {
+            return Number(assignment.vf_index) > 0 && !!assignment.running;
+        });
+        var atsKnown = me.isAtsPolicyKnown();
+        var atsUnsafe = atsKnown && gpuAtsBoolean(me.atsPolicy.affected) &&
+            !gpuAtsBoolean(me.atsPolicy.safe);
+
+        if (!atsKnown) {
+            button.setDisabled(true);
+            button.setTooltip(gettext('ATS safety state is unknown; use the native status view for read-only verification.'));
+        } else if (atsUnsafe) {
+            button.setDisabled(true);
+            button.setTooltip(gettext('ATS is unsafe for whole-GPU writes; use the native status view for read-only verification.'));
+        } else if (pfAssigned) {
+            button.setDisabled(false);
+            button.setTooltip(Ext.String.format(
+                gettext('The whole GPU is currently assigned to VM {0}. Open to verify it or choose a new stopped VM.'),
+                pfVmid || '?'
+            ));
+        } else if (!status) {
+            button.setDisabled(true);
+            button.setTooltip(gettext('Waiting for SR-IOV assignment state.'));
+        } else if (running.length > 0) {
+            button.setDisabled(true);
+            button.setTooltip(gettext('Stop every VF consumer VM before switching to whole-GPU passthrough.'));
+        } else {
+            button.setDisabled(false);
+            button.setTooltip(gettext('Detach all VF assignments, delete every VF, and assign the physical GPU to one VM.'));
         }
     },
 
@@ -2706,6 +4084,53 @@ Ext.define('PVE.panel.GpuSriovPanel', {
         // Load current VF data from the grid store
         var vfStore = me.down('#vfGrid').getStore();
         dlg.loadVfData(vfStore);
+    },
+
+    openWholeGpuDialog: function() {
+        var me = this;
+        if (!me.deviceRecord) { return; }
+        var bdf = me.deviceRecord.get('bdf');
+        if (!me.isAtsPolicyKnown() ||
+            (gpuAtsBoolean(me.atsPolicy.affected) &&
+             !gpuAtsBoolean(me.atsPolicy.safe))) {
+            Ext.Msg.alert(
+                gettext('ATS safety gate'),
+                gettext('ATS is unknown or unsafe for whole-GPU writes. Use the native status view for read-only verification; no repair write will be submitted.')
+            );
+            return;
+        }
+        var status = me.sriovStatus || {};
+        var assignments = Ext.isArray(status.assignments) ? status.assignments : [];
+        var running = Ext.Array.filter(assignments, function(assignment) {
+            return Number(assignment.vf_index) > 0 && !!assignment.running;
+        });
+        if (running.length > 0) {
+            Ext.Msg.alert(
+                gettext('Stop VM first'),
+                gettext('Stop every VF consumer VM before switching to whole-GPU passthrough.')
+            );
+            return;
+        }
+
+        var dlg = Ext.create('PVE.window.WholeGpuPassthroughDialog', {
+            pveSelNode: me.pveSelNode,
+            deviceRecord: me.deviceRecord,
+            sriovStatus: status
+        });
+        dlg.on('wholepassthroughchanged', function(window, changedBdf, data) {
+            if (changedBdf !== bdf || !me.isCurrentDevice(bdf)) {
+                return;
+            }
+            me.sriovRequestId++;
+            me.vfRequestId++;
+            me.sriovStatus = null;
+            me.vfDataLoaded = false;
+            me.down('#vfGrid').getStore().removeAll();
+            me.down('#modifyVfsBtn').setDisabled(true);
+            me.down('#wholeGpuBtn').setDisabled(true);
+            me.fireEvent('vfschanged', me, bdf, data);
+        });
+        dlg.show();
     },
 
     openVfAssignmentDialog: function(vfRecord) {
@@ -2767,17 +4192,17 @@ Ext.define('PVE.panel.GpuSriovPanel', {
 });
 
 /* =========================================================================
- * GpuDeviceDetail — right/bottom panel shown on row selection
+ * GpuDeviceDetail — selection controller with the VF workspace
  * ========================================================================= */
 
 Ext.define('PVE.panel.GpuDeviceDetail', {
     extend: 'Ext.panel.Panel',
     alias: 'widget.gpuDeviceDetail',
 
-    title: gettext('Device Detail'),
-    layout: { type: 'vbox', align: 'stretch' },
+    header: false,
+    border: false,
+    layout: 'fit',
     bodyPadding: 0,
-    scrollable: 'y',
 
     config: {
         pveSelNode: null
@@ -2787,66 +4212,82 @@ Ext.define('PVE.panel.GpuDeviceDetail', {
         var me = this;
 
         me.items = [
-            // Top row: properties + telemetry side by side
             {
-                xtype: 'container',
-                layout: { type: 'hbox', align: 'stretch' },
-                height: 230,
-                items: [
-                    {
-                        xtype: 'gpuPropertiesCard',
-                        itemId: 'propsCard',
-                        flex: 1,
-                        margin: '0 4 4 0',
-                        border: true
-                    },
-                    {
-                        xtype: 'gpuTelemetryCard',
-                        itemId: 'telemetryCard',
-                        flex: 2,
-                        margin: '0 0 4 4',
-                        border: true,
-                        pveSelNode: me.pveSelNode
-                    }
-                ]
+                xtype: 'component',
+                itemId: 'powerSleepNotice',
+                hidden: true,
+                padding: 16,
+                style: 'background:#f7f7f7;border:1px solid #ddd;color:#555;',
+                html: ''
             },
-            // SR-IOV panel
+            // Keep the safety policy loader alive for the whole-GPU gate, but
+            // render policy details only in the on-demand ATS dialog.
+            {
+                xtype: 'gpuAtsPolicyPanel',
+                itemId: 'atsPolicyProbe',
+                hidden: true,
+                pveSelNode: me.pveSelNode
+            },
             {
                 xtype: 'gpuSriovPanel',
                 itemId: 'sriovPanel',
-                flex: 1,
-                minHeight: 280,
                 pveSelNode: me.pveSelNode
             }
         ];
 
         me.callParent();
 
+        me.down('#atsPolicyProbe').on('atspolicychange', function(panel, bdf, policy) {
+            // ATS is an independent read.  Pass only the captured BDF to the
+            // SR-IOV panel so an older response cannot unlock another GPU.
+            me.down('#sriovPanel').setAtsPolicy(policy, bdf);
+        });
+
         // Propagate vfschanged up so the device grid can refresh
-        me.down('#sriovPanel').on('vfschanged', function() {
-            me.fireEvent('vfschanged', me);
+        me.down('#sriovPanel').on('vfschanged', function(panel, bdf, data) {
+            me.fireEvent('vfschanged', me, bdf, data);
         });
     },
 
     loadDevice: function(record) {
         var me = this;
+        var sleepNotice = me.down('#powerSleepNotice');
+        var sriovPanel = me.down('#sriovPanel');
         if (!record) {
-            me.setTitle(gettext('Device Detail'));
-            me.down('#propsCard').loadRecord(null);
-            me.down('#telemetryCard').loadDevice(null);
-            me.down('#sriovPanel').loadDevice(null);
+            me.down('#atsPolicyProbe').loadDevice(null);
+            sriovPanel.loadDevice(null);
+            sriovPanel.setVisible(true);
+            sleepNotice.setVisible(false);
             return;
         }
 
-        me.setTitle(Ext.String.format(
-            gettext('Device Detail: {0} ({1})'),
-            record.get('device_name'),
-            record.get('bdf')
-        ));
+        var powerMode = record.get('power_mode') || 'normal';
+        if (powerMode !== 'normal') {
+            // Do not let the hidden ATS probe or SR-IOV/debugfs status reads
+            // become the poller which wakes a deliberately sleeping B50.
+            me.down('#atsPolicyProbe').loadDevice(null);
+            sriovPanel.loadDevice(null);
+            sriovPanel.setVisible(false);
+            sleepNotice.setHtml(
+                '<div style="font-size:16px;font-weight:bold;color:#2673b8;margin-bottom:8px;">' +
+                '<i class="fa fa-moon-o"></i> ' + Ext.htmlEncode(gettext('GPU is in power-saving mode')) +
+                '</div>' + Ext.htmlEncode(Ext.String.format(
+                    gettext('{0} is parked with live VF-status and wake-up telemetry reads paused. Use the Power Saving button to restore the VF workspace.'),
+                    record.get('bdf')
+                ))
+            );
+            sleepNotice.setVisible(true);
+            return;
+        }
 
-        me.down('#propsCard').loadRecord(record);
-        me.down('#telemetryCard').loadDevice(record);
-        me.down('#sriovPanel').loadDevice(record);
+        sleepNotice.setVisible(false);
+        sriovPanel.setVisible(true);
+        me.down('#atsPolicyProbe').loadDevice(record);
+        sriovPanel.loadDevice(record);
+    },
+
+    setAtsPolicy: function(policy, bdf) {
+        this.down('#sriovPanel').setAtsPolicy(policy, bdf);
     }
 });
 
@@ -2873,8 +4314,8 @@ Ext.define('PVE.node.GpuManager', {
                 xtype: 'gpuDeviceGrid',
                 itemId: 'deviceGrid',
                 region: 'north',
-                height: 240,
-                split: true,
+                height: 166,
+                split: false,
                 pveSelNode: me.pveSelNode,
                 listeners: {
                     deviceselect: function(grid, record) {
@@ -2882,6 +4323,15 @@ Ext.define('PVE.node.GpuManager', {
                     },
                     vfioclick: function(grid, record) {
                         grid.openVfioDialog(record);
+                    },
+                    deviceinfoclick: function(grid, record) {
+                        me.openDevicePropertiesDialog(record);
+                    },
+                    powerpolicyclick: function(grid, record) {
+                        me.openPowerPolicyDialog(record);
+                    },
+                    atspolicyclick: function(grid, record) {
+                        me.openAtsPolicyDialog(record);
                     }
                 }
             },
@@ -2892,15 +4342,54 @@ Ext.define('PVE.node.GpuManager', {
                 region: 'center',
                 pveSelNode: me.pveSelNode,
                 listeners: {
-                    vfschanged: function() {
+                    vfschanged: function(detail, bdf) {
                         // Refresh device grid so VF counts / persisted icons update
-                        me.down('#deviceGrid').reload();
+                        me.down('#deviceGrid').reload(bdf);
                     }
                 }
             }
         ];
 
         me.callParent();
+    },
+
+    openDevicePropertiesDialog: function(record) {
+        if (!record) {
+            return;
+        }
+        Ext.create('PVE.window.GpuDevicePropertiesDialog', {
+            deviceRecord: record
+        }).show();
+    },
+
+    openAtsPolicyDialog: function(record) {
+        var me = this;
+        if (!record) {
+            return;
+        }
+        var dlg = Ext.create('PVE.window.GpuAtsPolicyDialog', {
+            pveSelNode: me.pveSelNode,
+            deviceRecord: record
+        });
+        dlg.on('atspolicychange', function(window, bdf, policy) {
+            me.down('#deviceDetail').setAtsPolicy(policy, bdf);
+        });
+        dlg.show();
+    },
+
+    openPowerPolicyDialog: function(record) {
+        var me = this;
+        if (!record) {
+            return;
+        }
+        var dlg = Ext.create('PVE.window.GpuPowerPolicyDialog', {
+            pveSelNode: me.pveSelNode,
+            deviceRecord: record
+        });
+        dlg.on('powerpolicychange', function(window, bdf) {
+            me.down('#deviceGrid').reload(bdf);
+        });
+        dlg.show();
     }
 });
 
@@ -2921,20 +4410,49 @@ Ext.define('PVE.node.GpuManagerOverride', {
 
     initComponent: function() {
         var me = this;
-
-        // Call the original initComponent chain
-        me.callParent(arguments);
-
-        // Use PVE.panel.Config's insertNodes to properly register our tab
-        // in both the tree navigation and the card layout
-        me.insertNodes([{
+        var gpuItem = {
             xtype: 'pveGpuManager',
             title: gettext('GPU'),
             iconCls: 'fa fa-microchip',
             itemId: 'gpugpu',
             pveSelNode: me.pveSelNode,
             nodename: me.pveSelNode.data.node
-        }]);
+        };
+        var baseInsertNodes = me.insertNodes;
+        var injected = false;
+
+        // PVE.node.Config creates its item array before PVE.panel.Config turns
+        // that array into a live TreeStore. Intercept that one conversion and
+        // splice GPU after Summary before the store exists. Moving a node after
+        // the navigation store is bound makes ExtJS' NodeStore lose its source.
+        me.insertNodes = function(items) {
+            if (!injected && Ext.isArray(items)) {
+                var summaryIndex = -1;
+                for (var i = 0; i < items.length; i++) {
+                    if (items[i].itemId === 'summary') {
+                        summaryIndex = i;
+                        break;
+                    }
+                }
+                if (summaryIndex >= 0) {
+                    items.splice(summaryIndex + 1, 0, gpuItem);
+                    injected = true;
+                }
+            }
+            return baseInsertNodes.call(me, items);
+        };
+
+        try {
+            me.callParent(arguments);
+        } finally {
+            me.insertNodes = baseInsertNodes;
+        }
+
+        // Restricted users may not receive Summary. Retain the previous safe
+        // top-level append as a fallback without attempting to move live nodes.
+        if (!injected) {
+            me.insertNodes([gpuItem]);
+        }
     }
 });
 

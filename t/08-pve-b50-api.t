@@ -379,7 +379,7 @@ my $persist_flag_config = PVE::API2::Hardware::GPU::parse_ini_config($config, 1)
 $persist_flag_config->{$pf}{persist} = 0;
 PVE::API2::Hardware::GPU::write_ini_config($config, $persist_flag_config);
 my $not_persisted = PVE::API2::Hardware::GPU::_collect_device($pf, 0);
-ok(!$not_persisted->{persisted},
+ok(!${$not_persisted->{persisted}},
     'device grid persistence follows persist=0 rather than section presence');
 my $disabled_vfs = PVE::API2::Hardware::GPU::_vf_records($not_persisted);
 is($disabled_vfs->[0]{resources}{vram}{mode}, 'unknown',

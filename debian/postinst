@@ -5,6 +5,7 @@ set -e
 
 PATCH_SCRIPT=${PVE_GPU_PATCH_SCRIPT:-/usr/lib/pve-gpu/reapply-patches.sh}
 SRIOV_SCRIPT=${PVE_GPU_SRIOV_SCRIPT:-/usr/lib/pve-gpu/apply-sriov-config.sh}
+PVE_GUESTS_DROPIN=${PVE_GPU_PVE_GUESTS_DROPIN:-/lib/systemd/system/pve-guests.service.d/10-pve-gpu-manager.conf}
 LEGACY_MODPROBE_CONF=${PVE_GPU_LEGACY_MODPROBE_CONF:-/etc/modprobe.d/pve-gpu-vfio.conf}
 LEGACY_MODULES_CONF=${PVE_GPU_LEGACY_MODULES_CONF:-/etc/modules-load.d/pve-gpu-vfio.conf}
 GRUB_DEFAULT=${PVE_GPU_GRUB_DEFAULT:-/etc/default/grub}
@@ -17,11 +18,18 @@ log() {
 enable_services() {
     command -v systemctl >/dev/null 2>&1 || return 0
 
-    systemctl daemon-reload || true
-    systemctl enable pve-gpu-vfio.service \
-        || log "WARNING: Failed to enable pve-gpu-vfio.service"
-    systemctl enable pve-gpu-sriov.service \
-        || log "WARNING: Failed to enable pve-gpu-sriov.service"
+    systemctl daemon-reload
+    systemctl enable pve-gpu-vfio.service
+    systemctl enable pve-gpu-sriov.service
+    if [ -e "$PVE_GUESTS_DROPIN" ]; then
+        loaded_unit=$(systemctl cat pve-guests.service)
+        printf '%s\n' "$loaded_unit" |
+            grep -Fq 'ExecStartPre=/usr/lib/pve-gpu/check-pve-gpu-binders.sh' \
+            || { log "ERROR: pve-guests binder preflight is not loaded"; return 1; }
+        printf '%s\n' "$loaded_unit" |
+            grep -Fq 'ExecStartPre=/usr/lib/pve-gpu/reapply-patches.sh --check-native' \
+            || { log "ERROR: pve-guests native GPU guard preflight is not loaded"; return 1; }
+    fi
     # Never apply persisted GPU state merely because a package was installed
     # or upgraded.  The API applies explicit user changes transactionally;
     # this service restores them only during a later boot, before pve-guests.
@@ -99,6 +107,17 @@ case "$1" in
         else
             "$PATCH_SCRIPT" --apply
         fi
+        enable_services
+        ;;
+    triggered)
+        if [ ! -x "$PATCH_SCRIPT" ]; then
+            log "ERROR: $PATCH_SCRIPT is missing or not executable"
+            exit 1
+        fi
+        # qemu-server and pve-manager own the files carrying our small marker
+        # integrations.  Reapply after either package replaces those files and
+        # reload every long-lived process which can start a VM.
+        "$PATCH_SCRIPT" --apply --force-restart
         enable_services
         ;;
     abort-upgrade|abort-remove|abort-deconfigure)

@@ -7,7 +7,7 @@ Standards-Version: 4.5.1
 
 Package: pve-gpu-manager
 Architecture: all
-Depends: pve-manager (>= 8.0), libpve-common-perl, pciutils, linux-perf, ${misc:Depends}, ${perl:Depends}
+Depends: pve-manager (>= 8.0), qemu-server (>= 8.0), libpve-common-perl, pciutils, linux-perf, ${misc:Depends}, ${perl:Depends}
 Description: GPU Manager for Proxmox VE
  Provides discovery, monitoring, and SR-IOV virtual function management
  for supported Intel Battlemage GPUs in Proxmox VE. Includes a web UI tab,

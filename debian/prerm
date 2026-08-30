@@ -4,6 +4,7 @@
 set -e
 
 PATCH_SCRIPT=/usr/lib/pve-gpu/reapply-patches.sh
+POWER_STATE=${PVE_GPU_POWER_STATE:-/run/pve-gpu/power-state.conf}
 
 log() {
     logger -t pve-gpu-prerm "$@" 2>/dev/null || true
@@ -22,6 +23,10 @@ disable_services() {
 
 case "$1" in
     remove|deconfigure)
+        if [ -s "$POWER_STATE" ]; then
+            log "ERROR: A GPU is still in PGM power-saving state. Exit Power Saving under Node > GPU or reboot before removing the package."
+            exit 1
+        fi
         if [ -x "$PATCH_SCRIPT" ]; then
             "$PATCH_SCRIPT" --remove
         else

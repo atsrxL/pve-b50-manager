@@ -727,8 +727,9 @@ snapshot_state() {
     OLD_SCHEDULER=""
     OLD_COUNT=$(read_value "$pf/sriov_numvfs") || fatal "Cannot read current VF count for $bdf"
     OLD_AUTOPROBE=$(read_value "$pf/sriov_drivers_autoprobe") || fatal "Cannot read current autoprobe for $bdf"
-    is_safe_uint "$OLD_COUNT" && [[ "$OLD_AUTOPROBE" =~ ^[01]$ ]] ||
+    if ! is_safe_uint "$OLD_COUNT" || [[ ! "$OLD_AUTOPROBE" =~ ^[01]$ ]]; then
         fatal "Invalid current SR-IOV state for $bdf"
+    fi
 
     if (( 10#$OLD_COUNT > 0 )); then
         wait_for_vf_tree "$bdf" "$((10#$OLD_COUNT))"

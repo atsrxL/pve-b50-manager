@@ -1,0 +1,4 @@
+interest-await /usr/share/perl5/PVE/QemuServer.pm
+interest-await /usr/share/perl5/PVE/QemuServer/PCI.pm
+interest-await /usr/share/perl5/PVE/API2/Hardware.pm
+interest-await /usr/share/pve-manager/index.html.tpl

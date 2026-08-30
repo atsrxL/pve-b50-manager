@@ -13,6 +13,7 @@ GRUB_DEFAULT=${PVE_GPU_GRUB_DEFAULT:-/etc/default/grub}
 INDEX_BACKUP=${PVE_GPU_INDEX_BACKUP:-/usr/share/pve-manager/index.html.tpl.pre-gpu}
 HARDWARE_BACKUP=${PVE_GPU_HARDWARE_BACKUP:-/usr/share/perl5/PVE/API2/Hardware.pm.pre-gpu}
 NODES_BACKUP=${PVE_GPU_NODES_BACKUP:-/usr/share/perl5/PVE/API2/Nodes.pm.pre-gpu}
+POWER_STATE=${PVE_GPU_POWER_STATE:-/run/pve-gpu/power-state.conf}
 
 log() {
     logger -t pve-gpu-postrm "$@" 2>/dev/null || true
@@ -49,6 +50,7 @@ case "$1" in
         rm -f "$LEGACY_MODULES_CONF"
         rm -f "$VFIO_CONF"
         rm -f "$SYSFS_ROOT_CONF"
+        rm -f "$POWER_STATE"
 
         # Old package versions created these whole-file backups. They are never
         # restored because doing so could downgrade files owned by Proxmox.
@@ -71,6 +73,12 @@ case "$1" in
         fi
         ;;
     remove|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        # The vendor pve-guests drop-in is removed after prerm.  Reload here so
+        # a normal package removal cannot retain a cached ExecStartPre which
+        # points at the now-removed checker.
+        if [ "$1" = remove ] && command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload || true
+        fi
         ;;
     *)
         echo "postrm called with unknown argument '$1'" >&2

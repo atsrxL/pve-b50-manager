@@ -26,6 +26,14 @@ use PVE::GPU::SRIOV qw(
     untaint_sysfs_write_path
     validate_vf_profiles
 );
+use PVE::GPU::Power qw(
+    clear_power_state_for_bdf
+    is_deep_idle
+    power_state_for_bdf
+    read_power_state
+    set_power_state_for_bdf
+    write_power_state
+);
 
 # ---------------------------------------------------------------------------
 # Vendor plugin registry
@@ -56,12 +64,26 @@ my $QEMU_CONF_DIR       = $ENV{PVE_GPU_QEMU_CONF_DIR}
     // '/etc/pve/qemu-server';
 my $PCI_RESERVATION_LOCK = $ENV{PVE_GPU_PCI_RESERVATION_LOCK}
     // '/run/qemu-server/pci-id-reservations.lock';
+my $B50_DEEP_IDLE_DELAY_MS = 10;
 
 sub _bool_value {
     my ($value) = @_;
     return 0 if !defined($value);
     return $$value ? 1 : 0 if ref($value) eq 'SCALAR';
     return $value ? 1 : 0;
+}
+
+sub _assert_power_mode_normal {
+    my ($bdf, $operation) = @_;
+    $operation //= 'access this GPU';
+    return 1 if !is_deep_idle($bdf);
+
+    my $mode = 'unknown';
+    my $record = eval { power_state_for_bdf($bdf) };
+    $mode = $record->{mode}
+        if ref($record) eq 'HASH' && defined($record->{mode}) && $record->{mode} ne '';
+    die "Cannot $operation while $bdf is in PGM '$mode' power-saving state. " .
+        "Exit Power Saving under Node > GPU and retry.\n";
 }
 
 # ---------------------------------------------------------------------------
@@ -631,6 +653,8 @@ sub _collect_device {
     my $device_id  = read_sysfs("$base/device")    // '';
     my $info = $plugin->identify_device($device_id);
     return undef unless defined $info;
+    my $deep_idle = is_deep_idle($bdf);
+    my $power_state = $deep_idle ? eval { power_state_for_bdf($bdf) } : undef;
 
     my $card = resolve_drm_card($bdf);
 
@@ -662,7 +686,12 @@ sub _collect_device {
 
     my $norm_device_id = lc($device_id);
     $norm_device_id = "0x$norm_device_id" unless $norm_device_id =~ /^0x/;
-    my $device_name = _get_device_name($bdf, $norm_device_id, $vendor_id);
+    # lspci and debugfs reads can runtime-resume a sleeping B50.  Once PGM has
+    # placed a PF in deep idle, use the static identity already available from
+    # sysfs and leave all wake-up telemetry to an explicit mode exit.
+    my $device_name = $deep_idle && $plugin->can('device_name_fallback')
+        ? $plugin->device_name_fallback($norm_device_id)
+        : _get_device_name($bdf, $norm_device_id, $vendor_id);
 
     # Check persistence
     my $persist_config = parse_ini_config($GPU_SRIOV_CONF);
@@ -690,6 +719,9 @@ sub _collect_device {
         drm_card         => $card // '',
         render_node      => $render_node // '',
         persisted        => $persisted,
+        power_mode       => $deep_idle && ref($power_state) eq 'HASH'
+            ? ($power_state->{mode} // 'deep-idle')
+            : ($deep_idle ? 'deep-idle' : 'normal'),
     };
 
     # Check VFIO persistence file for this device's BDF
@@ -711,12 +743,22 @@ sub _collect_device {
         push @vm_ids, grep { !$seen{$_}++ } map { $_->{vmid} } @$assigned;
         $record->{assigned_vms} = \@vm_ids;
     } else {
-        $record->{assigned_vms} = defined $pf_vm ? [$pf_vm] : [];
+        my %seen;
+        my @vm_ids = defined($pf_vm) ? ($pf_vm) : ();
+        $seen{$pf_vm} = 1 if defined($pf_vm);
+        if ($deep_idle && ref($power_state) eq 'HASH') {
+            for my $vmid (_power_state_list($power_state->{consumer_vmids})) {
+                push @vm_ids, int($vmid) if $vmid =~ /^\d+$/ && !$seen{$vmid}++;
+            }
+        }
+        $record->{assigned_vms} = \@vm_ids;
     }
 
     # Read firmware version from vendor plugin
-    if (defined $bdf) {
+    if (defined($bdf) && !$deep_idle) {
         $record->{firmware_version} = $plugin->read_firmware_version($bdf) // '';
+    } else {
+        $record->{firmware_version} = '';
     }
 
     if ($with_telemetry && defined $card) {
@@ -1166,6 +1208,15 @@ sub _assert_exact_vf_hostpci_entry {
         if @resolved != 1 || $resolved[0] ne $vf_bdf;
 }
 
+sub _assert_exact_gpu_hostpci_entry {
+    my ($vmid, $key, $value, $gpu_bdfs) = @_;
+    die "Cannot remove VM $vmid $key because it is a PCI mapping; remove the mapping-backed device in the VM Hardware panel\n"
+        if defined($value) && $value =~ /(?:^|,)mapping=/;
+    my @resolved = _resolve_hostpci_bdfs($value // '', 1);
+    die "Cannot safely change VM $vmid $key: the entry contains PCI functions outside this GPU\n"
+        if !@resolved || grep { !$gpu_bdfs->{$_} } @resolved;
+}
+
 sub _first_free_hostpci_key {
     my ($conf) = @_;
     for my $index (0 .. $PVE::QemuServer::PCI::MAX_HOSTPCI_DEVICES - 1) {
@@ -1178,6 +1229,13 @@ sub _first_free_hostpci_key {
 sub _format_vf_hostpci_value {
     my ($conf, $vf_bdf) = @_;
     my $value = "$vf_bdf,rombar=0";
+    $value .= ',pcie=1' if PVE::QemuServer::Machine::machine_type_is_q35($conf);
+    return $value;
+}
+
+sub _format_pf_hostpci_value {
+    my ($conf, $pf_bdf) = @_;
+    my $value = $pf_bdf;
     $value .= ',pcie=1' if PVE::QemuServer::Machine::machine_type_is_q35($conf);
     return $value;
 }
@@ -1210,6 +1268,7 @@ sub _set_vf_assignment {
         if $target_vmid < 0;
 
     return _with_gpu_lock(sub {
+        _assert_power_mode_normal($pf_bdf, 'change a VF assignment');
         my @vmids = _all_qemu_vmids();
         my %known_vmid = map { $_ => 1 } @vmids;
         die "QEMU VM $target_vmid does not exist on this node\n"
@@ -1751,9 +1810,19 @@ sub _rollback_state {
 
     if ($topology_changed && $snapshot->{count} > 0) {
         for my $old (@{$snapshot->{drivers}}) {
-            next if !$old->{driver};
+            next if !$old->{driver} && !exists($old->{override});
             my $vf_bdf = _vf_bdf($rec->{bdf}, $old->{vf_index});
-            eval { _bind_vf_driver($vf_bdf, $old->{driver}) };
+            eval {
+                if (exists($old->{override})) {
+                    _restore_vf_driver_state(
+                        $vf_bdf,
+                        $old->{driver},
+                        $old->{override},
+                    );
+                } else {
+                    _bind_vf_driver($vf_bdf, $old->{driver});
+                }
+            };
             push @errors, "driver rollback VF$old->{vf_index}: $@" if $@;
         }
     }
@@ -2097,6 +2166,7 @@ sub _configure_sriov_v2 {
     my ($bdf, $param) = @_;
 
     return _with_gpu_lock(sub {
+        _assert_power_mode_normal($bdf, 'change SR-IOV state');
         my $rec = _collect_device($bdf, 0);
         die "Device '$bdf' not found or not a supported GPU\n" if !defined($rec);
 
@@ -2338,6 +2408,590 @@ sub _configure_sriov_v2 {
 }
 
 # ---------------------------------------------------------------------------
+# B50 runtime deep-idle policy
+# ---------------------------------------------------------------------------
+
+sub _is_b50_power_device {
+    my ($rec) = @_;
+    return 0 if ref($rec) ne 'HASH';
+    my $vendor = lc($rec->{vendor_id} // '');
+    my $device = lc($rec->{device_id} // '');
+    $vendor =~ s/^0x//;
+    $device =~ s/^0x//;
+    return $vendor eq '8086' && $device eq 'e212' ? 1 : 0;
+}
+
+sub _power_runtime_attributes {
+    my ($bdf) = @_;
+    my $base = "/sys/bus/pci/devices/$bdf";
+    my $usage = read_sysfs("$base/power/runtime_usage");
+    my $delay = read_sysfs("$base/power/autosuspend_delay_ms");
+    return {
+        control => read_sysfs("$base/power/control"),
+        autosuspend_delay_ms =>
+            defined($delay) && $delay =~ /^-?\d+$/ ? int($delay) : undef,
+        runtime_status => read_sysfs("$base/power/runtime_status"),
+        runtime_usage =>
+            defined($usage) && $usage =~ /^\d+$/ ? int($usage) : undef,
+        pci_power_state => read_sysfs("$base/power_state"),
+    };
+}
+
+sub _write_power_attribute {
+    my ($bdf, $name, $value) = @_;
+    my $path = "/sys/bus/pci/devices/$bdf/power/$name";
+    write_sysfs($path, $value);
+    my $actual = read_sysfs($path);
+    die "Power attribute verification failed for '$path': requested '$value', found '" .
+        (defined($actual) ? $actual : 'unreadable') . "'\n"
+        if !defined($actual) || "$actual" ne "$value";
+}
+
+sub _restore_power_attributes {
+    my ($bdf, $state) = @_;
+    my $delay = $state->{restore_delay};
+    my $control = $state->{restore_control};
+    die "Saved autosuspend delay is invalid for $bdf\n"
+        if !defined($delay) || $delay !~ /^-?\d+$/;
+    die "Saved runtime power control is invalid for $bdf\n"
+        if !defined($control) || $control !~ /^(?:auto|on)$/;
+    _write_power_attribute($bdf, 'autosuspend_delay_ms', int($delay));
+    _write_power_attribute($bdf, 'control', $control);
+}
+
+sub _set_deep_idle_power_attributes {
+    my ($bdf) = @_;
+    _write_power_attribute($bdf, 'control', 'auto');
+    _write_power_attribute($bdf, 'autosuspend_delay_ms', $B50_DEEP_IDLE_DELAY_MS);
+}
+
+sub _wait_for_deep_idle {
+    my ($bdf, $timeout_ms) = @_;
+    $timeout_ms //= 5_000;
+    my $elapsed = 0;
+    my $last = {};
+    while ($elapsed <= $timeout_ms) {
+        $last = _power_runtime_attributes($bdf);
+        my $usage_idle = defined($last->{runtime_usage}) && $last->{runtime_usage} == 0;
+        my $runtime_suspended = ($last->{runtime_status} // '') eq 'suspended';
+        my $pci_state = $last->{pci_power_state};
+        my $pci_suspended = !defined($pci_state) || $pci_state eq '' || $pci_state =~ /^D3/i;
+        return $last if $usage_idle && $runtime_suspended && $pci_suspended;
+        usleep(100_000);
+        $elapsed += 100;
+    }
+    die "B50 did not enter runtime suspend within ${timeout_ms}ms: runtime_status='" .
+        ($last->{runtime_status} // 'unknown') . "', runtime_usage='" .
+        (defined($last->{runtime_usage}) ? $last->{runtime_usage} : 'unknown') .
+        "', PCI power='" . ($last->{pci_power_state} // 'unknown') .
+        "'. A process may still be polling the GPU.\n";
+}
+
+sub _power_state_list {
+    my ($value) = @_;
+    return () if !defined($value) || $value eq '';
+    return grep { $_ ne '' } map {
+        my $item = $_;
+        $item =~ s/^\s+|\s+$//g;
+        $item;
+    } split(/,/, $value);
+}
+
+sub _saved_power_vf_bdfs {
+    my ($state) = @_;
+    my @bdfs;
+    my %seen;
+    for my $raw (_power_state_list($state->{vf_bdfs})) {
+        my $bdf = _normalise_bdf($raw);
+        die "Invalid VF BDF '$raw' in B50 power state\n" if !defined($bdf);
+        die "Duplicate VF BDF '$bdf' in B50 power state\n" if $seen{$bdf}++;
+        push @bdfs, $bdf;
+    }
+    return @bdfs;
+}
+
+sub _validate_power_state_record {
+    my ($rec, $state) = @_;
+    die "B50 power state for $rec->{bdf} is unavailable\n"
+        if ref($state) ne 'HASH';
+    die "Unsupported B50 power-state format for $rec->{bdf}\n"
+        if ($state->{api_version} // '') ne '1';
+    die "Unknown B50 power state '" . ($state->{mode} // '') . "' for $rec->{bdf}\n"
+        if ($state->{mode} // '') !~ /^(?:entering|deep-idle|exiting|restored)$/;
+
+    my $count = $state->{restore_count};
+    die "Saved VF restore count is invalid for $rec->{bdf}\n"
+        if !defined($count) || $count !~ /^\d+$/;
+    $count = int($count);
+    die "Saved VF restore count exceeds the device limit for $rec->{bdf}\n"
+        if $count > int($rec->{max_vfs} // 0);
+
+    die "Saved driver-autoprobe state is invalid for $rec->{bdf}\n"
+        if ($state->{restore_autoprobe} // '') !~ /^[01]$/;
+    die "Saved scheduler state is invalid for $rec->{bdf}\n"
+        if ($state->{restore_scheduler} // '') !~ /^(?:|low|normal)$/;
+    die "Saved runtime power control is invalid for $rec->{bdf}\n"
+        if ($state->{restore_control} // '') !~ /^(?:auto|on)$/;
+    die "Saved autosuspend delay is invalid for $rec->{bdf}\n"
+        if ($state->{restore_delay} // '') !~ /^-?\d+$/;
+
+    my @saved_bdfs = _saved_power_vf_bdfs($state);
+    die "Saved VF BDF count mismatch for $rec->{bdf}: expected $count, found " .
+        scalar(@saved_bdfs) . "\n"
+        if @saved_bdfs != $count;
+
+    my %vmids;
+    for my $vmid (_power_state_list($state->{consumer_vmids})) {
+        die "Invalid consumer VMID '$vmid' in B50 power state for $rec->{bdf}\n"
+            if $vmid !~ /^\d+$/ || int($vmid) < 100;
+        die "Duplicate consumer VMID '$vmid' in B50 power state for $rec->{bdf}\n"
+            if $vmids{int($vmid)}++;
+    }
+    return $state;
+}
+
+sub _persisted_power_profiles {
+    my ($rec, $expected_count) = @_;
+    my $config = parse_ini_config($GPU_SRIOV_CONF, 1);
+    my $device = $config->{$rec->{bdf}};
+    die "Deep idle requires a persistent SR-IOV profile for $rec->{bdf}\n"
+        if ref($device) ne 'HASH' || ($device->{persist} // '') ne '1';
+    die "Persistent SR-IOV profile for $rec->{bdf} has an invalid VF count\n"
+        if ($device->{num_vfs} // '') !~ /^\d+$/;
+    die "Persistent SR-IOV profile count changed for $rec->{bdf}: expected " .
+        "$expected_count, found $device->{num_vfs}\n"
+        if int($device->{num_vfs}) != $expected_count;
+
+    my $configured_device = lc($device->{device_id} // '');
+    $configured_device = "0x$configured_device"
+        if $configured_device ne '' && $configured_device !~ /^0x/;
+    die "Persistent SR-IOV profile identity does not match $rec->{bdf}\n"
+        if $configured_device ne '' && $configured_device ne lc($rec->{device_id} // '');
+    die "Persistent SR-IOV family does not match $rec->{bdf}\n"
+        if defined($device->{family}) && $device->{family} ne '' &&
+           $device->{family} ne ($rec->{family} // '');
+
+    my $autoprobe = $device->{drivers_autoprobe};
+    die "Persistent driver-autoprobe state is invalid for $rec->{bdf}\n"
+        if !defined($autoprobe) || $autoprobe !~ /^[01]$/;
+    my $scheduler = lc($device->{sched_priority} // '');
+    die "Persistent scheduler profile is invalid for $rec->{bdf}\n"
+        if $scheduler !~ /^(?:low|normal)$/;
+    die "Persistent normal scheduler lacks its safety acknowledgement for $rec->{bdf}\n"
+        if $scheduler eq 'normal' && !($device->{allow_unsafe_scheduler} // 0);
+
+    my @profiles;
+    my %drivers;
+    for my $vf (1 .. $expected_count) {
+        my $section = $config->{"$rec->{bdf}/vf$vf"};
+        die "Persistent profile for VF$vf of $rec->{bdf} is missing\n"
+            if ref($section) ne 'HASH';
+        my %resources;
+        for my $name (@VF_RESOURCE_NAMES) {
+            my $mode = lc($section->{"${name}_mode"} // '');
+            die "Persistent VF$vf resource '$name' has an invalid mode\n"
+                if $mode !~ /^(?:auto|custom)$/;
+            $resources{$name} = { mode => $mode };
+            if ($mode eq 'custom') {
+                my $quota = $section->{"${name}_quota"};
+                die "Persistent VF$vf resource '$name' has an invalid quota\n"
+                    if !defined($quota) || $quota !~ /^\d+$/;
+                $resources{$name}{quota} = int($quota);
+            }
+        }
+        my $driver = $section->{driver} // '';
+        die "Persistent VF$vf driver '$driver' is unsupported\n"
+            if $driver !~ /^(?:|vfio-pci|xe)$/;
+        $drivers{$vf} = $driver;
+        push @profiles, { vf_index => $vf, resources => \%resources };
+    }
+
+    return {
+        config => $config,
+        profiles => $expected_count > 0
+            ? validate_vf_profiles(\@profiles, $expected_count)
+            : [],
+        drivers => \%drivers,
+        autoprobe => int($autoprobe),
+        scheduler => $scheduler,
+    };
+}
+
+sub _power_consumers {
+    my ($rec, $state) = @_;
+    my $count = int($rec->{sriov_numvfs} // 0);
+    return check_vf_vm_assignments($rec->{bdf}, $rec->{drm_card}, $count, 1)
+        if $count > 0;
+
+    my %targets = ($rec->{bdf} => 1);
+    my %index = ($rec->{bdf} => 0);
+    my @saved = ref($state) eq 'HASH' ? _saved_power_vf_bdfs($state) : ();
+    for my $offset (0 .. $#saved) {
+        $targets{$saved[$offset]} = 1;
+        $index{$saved[$offset]} = $offset + 1;
+    }
+    my $consumers = _scan_qemu_pci_consumers(\%targets, 1);
+    $_->{vf_index} = $index{$_->{bdf}} for @$consumers;
+    return $consumers;
+}
+
+sub _power_blocker {
+    my ($code, $detail) = @_;
+    return { code => $code, detail => $detail };
+}
+
+sub _power_policy_status {
+    my ($bdf) = @_;
+    my $rec = _collect_device($bdf, 0);
+    die "Device '$bdf' not found or not a supported GPU\n" if !defined($rec);
+    my $state = power_state_for_bdf($bdf);
+    _validate_power_state_record($rec, $state) if ref($state) eq 'HASH';
+    my $mode = ref($state) eq 'HASH' ? ($state->{mode} // 'unknown') : 'normal';
+    my $runtime = _power_runtime_attributes($bdf);
+    my $consumers = _power_consumers($rec, $state);
+    my @running = grep { $_->{running} } @$consumers;
+    my @pf_consumers = grep { ($_->{vf_index} // 0) == 0 } @$consumers;
+    my @blockers;
+    my $supported = _is_b50_power_device($rec);
+    push @blockers, _power_blocker(
+        'unsupported_device',
+        'Deep idle is currently limited to the Intel Arc Pro B50 PF (8086:e212).',
+    ) if !$supported;
+    push @blockers, _power_blocker(
+        'driver',
+        "The B50 PF must be bound to xe (current: " . ($rec->{driver} || 'unbound') . ').',
+    ) if $supported && ($rec->{driver} // '') ne 'xe';
+    push @blockers, _power_blocker(
+        'pf_assignment',
+        'The physical GPU is assigned to a VM; release whole-GPU passthrough first.',
+    ) if @pf_consumers;
+    push @blockers, _power_blocker(
+        'running_consumer',
+        'Stop every VM using this GPU: ' . _format_consumers(\@running),
+    ) if @running;
+
+    my $persistent_profile = 0;
+    my $config_drift = 0;
+    my $profile_error = '';
+    my $profile_count = $mode eq 'normal'
+        ? int($rec->{sriov_numvfs})
+        : int($state->{restore_count} // 0);
+    if ($profile_count > 0) {
+        my $profile;
+        my $ok = eval {
+            $profile = _persisted_power_profiles($rec, $profile_count);
+            1;
+        };
+        if ($ok) {
+            $persistent_profile = 1;
+            if ($mode eq 'normal') {
+                my $vfs = _vf_records($rec);
+                my $scheduler = _read_scheduler_priority($rec);
+                my $drift = _calculate_persistence_drift(
+                    $rec,
+                    $profile->{config},
+                    $vfs,
+                    $scheduler,
+                );
+                $config_drift = $drift->{has_drift} ? 1 : 0;
+                $profile_error = join('; ', @{$drift->{issues}}) if $config_drift;
+            }
+        } else {
+            $profile_error = $@;
+            $profile_error =~ s/\s+\z//;
+        }
+        if ($mode eq 'normal' && (!$persistent_profile || $config_drift)) {
+            push @blockers, _power_blocker(
+                'persistent_profile',
+                $profile_error || 'Save and verify the current VF profile before entering deep idle.',
+            );
+        }
+    }
+
+    my $effective = $mode ne 'normal' &&
+        int($rec->{sriov_numvfs}) == 0 &&
+        ($runtime->{control} // '') eq 'auto' &&
+        defined($runtime->{autosuspend_delay_ms}) &&
+        $runtime->{autosuspend_delay_ms} == $B50_DEEP_IDLE_DELAY_MS;
+    my $can_exit = $mode ne 'normal' && $supported && !@running && !@pf_consumers &&
+        ($rec->{driver} // '') eq 'xe' &&
+        ($profile_count == 0 || $persistent_profile);
+
+    return {
+        api_version => 1,
+        bdf => $bdf,
+        supported => $supported ? \1 : \0,
+        mode => $mode,
+        effective => $effective ? \1 : \0,
+        sleeping => ($runtime->{runtime_status} // '') eq 'suspended' ? \1 : \0,
+        runtime_only => \1,
+        driver => $rec->{driver},
+        active_vfs => int($rec->{sriov_numvfs}),
+        saved_vfs => $profile_count,
+        persistent_profile => $persistent_profile ? \1 : \0,
+        config_drift => $config_drift ? \1 : \0,
+        assignments => [map {
+            +{
+                %$_,
+                running => $_->{running} ? \1 : \0,
+            }
+        } @$consumers],
+        blockers => \@blockers,
+        can_enter => $mode eq 'normal' && !@blockers ? \1 : \0,
+        can_exit => $can_exit ? \1 : \0,
+        autosuspend_delay_ms => $runtime->{autosuspend_delay_ms},
+        runtime_status => $runtime->{runtime_status},
+        runtime_usage => $runtime->{runtime_usage},
+        pci_power_state => $runtime->{pci_power_state},
+        power_control => $runtime->{control},
+        target_autosuspend_delay_ms => $B50_DEEP_IDLE_DELAY_MS,
+        profile_error => $profile_error,
+    };
+}
+
+sub _enter_deep_idle {
+    my ($bdf) = @_;
+    return _with_gpu_lock(sub {
+        my @vmids = _all_qemu_vmids();
+        return _with_vm_locks(\@vmids, sub {
+            return _with_pci_reservation_lock(sub {
+                my $status = _power_policy_status($bdf);
+                return $status if $status->{mode} eq 'deep-idle';
+                if (!_bool_value($status->{can_enter})) {
+                    my $detail = join('; ', map { $_->{detail} } @{$status->{blockers}});
+                    die "Cannot enter B50 deep idle: " . ($detail || 'safety state is unavailable') . "\n";
+                }
+
+                my $rec = _collect_device($bdf, 0);
+                my $count = _read_sriov_numvfs($bdf, "deep-idle VF count for $bdf");
+                my $consumers = _power_consumers($rec, undef);
+                my @running = grep { $_->{running} } @$consumers;
+                die "Cannot enter deep idle while a GPU consumer is running: " .
+                    _format_consumers(\@running) . "\n" if @running;
+
+                my $snapshot = _snapshot_state($rec);
+                my $runtime = _power_runtime_attributes($bdf);
+                die "Runtime power control is unavailable for $bdf\n"
+                    if !defined($runtime->{control}) || $runtime->{control} !~ /^(?:auto|on)$/;
+                die "Runtime autosuspend delay is unavailable for $bdf\n"
+                    if !defined($runtime->{autosuspend_delay_ms});
+                my @vf_bdfs = map { $_->{bdf} // '' } @{$snapshot->{drivers}};
+                die "Cannot snapshot every VF BDF for $bdf\n"
+                    if grep { $_ eq '' } @vf_bdfs;
+                my %consumer_vmids = map { $_->{vmid} => 1 } @$consumers;
+                my $old_power_state = read_power_state();
+                my $state = {
+                    api_version => 1,
+                    mode => 'entering',
+                    restore_count => $count,
+                    restore_autoprobe => $snapshot->{autoprobe},
+                    restore_scheduler => $snapshot->{scheduler} // '',
+                    restore_control => $runtime->{control},
+                    restore_delay => $runtime->{autosuspend_delay_ms},
+                    vf_bdfs => join(',', @vf_bdfs),
+                    consumer_vmids => join(',', sort { $a <=> $b } keys %consumer_vmids),
+                };
+
+                set_power_state_for_bdf($bdf, $state);
+                my $topology_mutated = 0;
+                my $ok = eval {
+                    _set_autoprobe($bdf, 0);
+                    if ($count > 0) {
+                        _unbind_all_vfs($bdf, $count);
+                        $topology_mutated = 1;
+                        write_sysfs("/sys/bus/pci/devices/$bdf/sriov_numvfs", 0);
+                        my $zero = _read_sriov_numvfs($bdf, "deep-idle VF removal for $bdf");
+                        die "Deep-idle VF removal verification failed: sriov_numvfs=$zero\n"
+                            if $zero != 0;
+                    }
+                    _set_deep_idle_power_attributes($bdf);
+                    _wait_for_deep_idle($bdf, 5_000);
+                    $state->{mode} = 'deep-idle';
+                    set_power_state_for_bdf($bdf, $state);
+                    1;
+                };
+                my $error = $@;
+                if (!$ok) {
+                    my @rollback_errors;
+                    my $sriov_errors = _rollback_state($rec, $snapshot, $topology_mutated);
+                    push @rollback_errors, @$sriov_errors;
+                    eval {
+                        _write_power_attribute(
+                            $bdf,
+                            'autosuspend_delay_ms',
+                            $runtime->{autosuspend_delay_ms},
+                        );
+                        _write_power_attribute($bdf, 'control', $runtime->{control});
+                    };
+                    push @rollback_errors, "power attributes: $@" if $@;
+                    eval { write_power_state($old_power_state) };
+                    push @rollback_errors, "power state file: $@" if $@;
+                    my $detail = @rollback_errors
+                        ? ' Rollback also reported: ' . join(' | ', @rollback_errors)
+                        : '';
+                    die "Entering B50 deep idle failed: $error$detail\n";
+                }
+                return _power_policy_status($bdf);
+            });
+        });
+    });
+}
+
+sub _verify_restored_power_topology {
+    my ($rec, $state, $profile) = @_;
+    my $expected = int($state->{restore_count} // 0);
+    my $actual = _read_sriov_numvfs($rec->{bdf}, "restored VF count for $rec->{bdf}");
+    die "Restored VF count mismatch: expected $expected, found $actual\n"
+        if $actual != $expected;
+    my @saved_bdfs = _saved_power_vf_bdfs($state);
+    die "Saved VF BDF count mismatch for $rec->{bdf}: expected $expected, found " .
+        scalar(@saved_bdfs) . "\n"
+        if @saved_bdfs != $expected;
+    for my $vf (1 .. $expected) {
+        my $actual_bdf = _vf_bdf($rec->{bdf}, $vf);
+        die "Restored VF$vf is unavailable for $rec->{bdf}\n" if !defined($actual_bdf);
+        die "Restored VF$vf BDF changed: expected $saved_bdfs[$vf - 1], found $actual_bdf\n"
+            if $actual_bdf ne $saved_bdfs[$vf - 1];
+        my $expected_driver = $profile->{drivers}{$vf} // '';
+        my $actual_driver = _pci_driver($actual_bdf);
+        die "Restored VF$vf driver mismatch: expected '" .
+            ($expected_driver || 'unbound') . "', found '" .
+            ($actual_driver || 'unbound') . "'\n"
+            if $actual_driver ne $expected_driver;
+    }
+    if ($expected > 0) {
+        my $updated = _collect_device($rec->{bdf}, 0) // $rec;
+        my $vfs = _vf_records($updated);
+        my $scheduler = _read_scheduler_priority($updated);
+        my $drift = _calculate_persistence_drift(
+            $updated,
+            $profile->{config},
+            $vfs,
+            $scheduler,
+        );
+        die "Restored VF profile verification failed: " . join('; ', @{$drift->{issues}}) . "\n"
+            if $drift->{has_drift};
+    }
+    return 1;
+}
+
+sub _rollback_exit_to_deep_idle {
+    my ($rec, $state) = @_;
+    my @errors;
+    eval {
+        my $count = _read_sriov_numvfs($rec->{bdf}, "failed-exit VF count for $rec->{bdf}");
+        _set_autoprobe($rec->{bdf}, 0);
+        if ($count > 0) {
+            _unbind_all_vfs($rec->{bdf}, $count);
+            write_sysfs("/sys/bus/pci/devices/$rec->{bdf}/sriov_numvfs", 0);
+            my $zero = _read_sriov_numvfs($rec->{bdf}, "failed-exit VF removal for $rec->{bdf}");
+            die "sriov_numvfs=$zero after failed-exit cleanup\n" if $zero != 0;
+        }
+    };
+    push @errors, "topology: $@" if $@;
+    eval { _set_deep_idle_power_attributes($rec->{bdf}) };
+    push @errors, "power attributes: $@" if $@;
+    eval {
+        $state->{mode} = 'deep-idle';
+        set_power_state_for_bdf($rec->{bdf}, $state);
+    };
+    push @errors, "power state file: $@" if $@;
+    return \@errors;
+}
+
+sub _exit_deep_idle {
+    my ($bdf) = @_;
+    return _with_gpu_lock(sub {
+        my @vmids = _all_qemu_vmids();
+        return _with_vm_locks(\@vmids, sub {
+            return _with_pci_reservation_lock(sub {
+                my $state = power_state_for_bdf($bdf);
+                return _power_policy_status($bdf) if ref($state) ne 'HASH';
+                my $mode = $state->{mode} // '';
+                die "Unknown B50 power state '$mode' for $bdf\n"
+                    if $mode !~ /^(?:entering|deep-idle|exiting|restored)$/;
+                my $rec = _collect_device($bdf, 0);
+                die "Device '$bdf' not found or not a supported GPU\n" if !defined($rec);
+                die "Power saving exit is only supported for an Intel B50 PF\n"
+                    if !_is_b50_power_device($rec);
+                die "Power saving exit requires the B50 PF to remain on xe\n"
+                    if ($rec->{driver} // '') ne 'xe';
+                _validate_power_state_record($rec, $state);
+                my $restore_count = $state->{restore_count};
+                $restore_count = int($restore_count);
+                my $consumers = _power_consumers($rec, $state);
+                my @running = grep { $_->{running} } @$consumers;
+                die "Cannot restore B50 VF topology while a GPU consumer is running: " .
+                    _format_consumers(\@running) . "\n" if @running;
+                my @pf_consumers = grep { ($_->{vf_index} // 0) == 0 } @$consumers;
+                die "Cannot restore B50 VF topology while the physical GPU is assigned: " .
+                    _format_consumers(\@pf_consumers) . "\n" if @pf_consumers;
+                my $profile = $restore_count > 0
+                    ? _persisted_power_profiles($rec, $restore_count)
+                    : {
+                        config => parse_ini_config($GPU_SRIOV_CONF, 1),
+                        profiles => [],
+                        drivers => {},
+                        autoprobe => int($state->{restore_autoprobe} // 0),
+                        scheduler => $state->{restore_scheduler} // '',
+                    };
+
+                if ($mode eq 'restored') {
+                    _verify_restored_power_topology($rec, $state, $profile);
+                    _restore_power_attributes($bdf, $state);
+                    clear_power_state_for_bdf($bdf);
+                    return _power_policy_status($bdf);
+                }
+
+                my $ok = eval {
+                    $state->{mode} = 'exiting';
+                    set_power_state_for_bdf($bdf, $state);
+                    my $current = _read_sriov_numvfs($bdf, "pre-restore VF count for $bdf");
+                    _set_autoprobe($bdf, 0);
+                    if ($current > 0) {
+                        _unbind_all_vfs($bdf, $current);
+                        write_sysfs("/sys/bus/pci/devices/$bdf/sriov_numvfs", 0);
+                        my $zero = _read_sriov_numvfs($bdf, "pre-restore cleanup for $bdf");
+                        die "Cannot reset partial VF topology before restore: sriov_numvfs=$zero\n"
+                            if $zero != 0;
+                    }
+
+                    if ($restore_count > 0) {
+                        _prepare_auto_provisioning($rec);
+                        write_sysfs("/sys/bus/pci/devices/$bdf/sriov_numvfs", $restore_count);
+                        _wait_for_vfs($rec, $profile->{profiles}, 10_000);
+                        _apply_profiles($rec, $profile->{profiles});
+                        _set_scheduler_priority($rec, $profile->{scheduler});
+                        for my $vf (1 .. $restore_count) {
+                            my $vf_bdf = _vf_bdf($bdf, $vf);
+                            die "Cannot resolve restored VF$vf for $bdf\n" if !defined($vf_bdf);
+                            _bind_vf_driver($vf_bdf, $profile->{drivers}{$vf})
+                                if ($profile->{drivers}{$vf} // '') ne '';
+                        }
+                    }
+                    _set_autoprobe($bdf, $profile->{autoprobe});
+                    _verify_restored_power_topology($rec, $state, $profile);
+                    _restore_power_attributes($bdf, $state);
+                    $state->{mode} = 'restored';
+                    set_power_state_for_bdf($bdf, $state);
+                    clear_power_state_for_bdf($bdf);
+                    1;
+                };
+                my $error = $@;
+                if (!$ok) {
+                    my $rollback_errors = _rollback_exit_to_deep_idle($rec, $state);
+                    my $detail = @$rollback_errors
+                        ? ' Rollback also reported: ' . join(' | ', @$rollback_errors)
+                        : '';
+                    die "Exiting B50 deep idle failed: $error$detail\n";
+                }
+                return _power_policy_status($bdf);
+            });
+        });
+    });
+}
+
+# ---------------------------------------------------------------------------
 # API endpoint definitions
 # ---------------------------------------------------------------------------
 
@@ -2364,8 +3018,10 @@ __PACKAGE__->register_method({
     },
     code => sub {
         my ($param) = @_;
-        my @devices = _enumerate_devices();
-        return \@devices;
+        return _with_gpu_lock(sub {
+            my @devices = _enumerate_devices();
+            return \@devices;
+        });
     },
 });
 
@@ -2394,9 +3050,11 @@ __PACKAGE__->register_method({
     code => sub {
         my ($param) = @_;
         my $bdf = $param->{bdf};
-        my $rec = _collect_device($bdf, 1);
-        die "Device '$bdf' not found or not a supported GPU\n" unless defined $rec;
-        return $rec;
+        return _with_gpu_lock(sub {
+            my $rec = _collect_device($bdf, 1);
+            die "Device '$bdf' not found or not a supported GPU\n" unless defined $rec;
+            return $rec;
+        });
     },
 });
 
@@ -2425,8 +3083,10 @@ __PACKAGE__->register_method({
     code => sub {
         my ($param) = @_;
         my $bdf = $param->{bdf};
-        my $rec = _collect_device($bdf, 0);
-        die "Device '$bdf' not found or not a supported GPU\n" if !defined($rec);
+        return _with_gpu_lock(sub {
+            _assert_power_mode_normal($bdf, 'read SR-IOV status');
+            my $rec = _collect_device($bdf, 0);
+            die "Device '$bdf' not found or not a supported GPU\n" if !defined($rec);
 
         my $prechecks = run_prechecks($bdf, $rec->{drm_card}, $rec->{vendor_id});
         my @tile_resources;
@@ -2461,7 +3121,7 @@ __PACKAGE__->register_method({
             $scheduler,
         );
 
-        return {
+            return {
             api_version => 3,
             bdf => $bdf,
             prechecks => $prechecks,
@@ -2500,7 +3160,8 @@ __PACKAGE__->register_method({
                     ? 'Stop all consumer VMs before changing VF resources'
                     : '',
             },
-        };
+            };
+        });
     },
 });
 
@@ -2654,6 +3315,65 @@ __PACKAGE__->register_method({
 # ---------------------------------------------------------------------------
 my $VFIO_CONF = $ENV{PVE_GPU_VFIO_CONF} // '/etc/pve-gpu-vfio.conf';
 
+sub _assert_vm_can_change_pf_passthrough {
+    my ($vmid, $conf) = @_;
+    die "VM $vmid configuration is unavailable\n" if ref($conf) ne 'HASH';
+    die "Cannot assign a physical GPU to VM $vmid because it is a template\n"
+        if _bool_value($conf->{template});
+    die "Cannot change physical GPU passthrough while VM $vmid is locked ($conf->{lock})\n"
+        if defined($conf->{lock}) && $conf->{lock} ne '';
+    die "Stop VM $vmid before changing physical GPU passthrough\n"
+        if _vm_is_running($vmid);
+
+    my @pending = _pending_hostpci_changes($conf);
+    die "Resolve pending PCI changes for VM $vmid first (" . join(', ', @pending) . ")\n"
+        if @pending;
+}
+
+sub _assert_vm_can_verify_pf_passthrough {
+    my ($vmid, $conf) = @_;
+    die "VM $vmid configuration is unavailable\n" if ref($conf) ne 'HASH';
+    die "Cannot use a template as a whole-GPU passthrough target (VM $vmid)\n"
+        if _bool_value($conf->{template});
+    my @pending = _pending_hostpci_changes($conf);
+    die "Resolve pending PCI changes for VM $vmid first (" . join(', ', @pending) . ")\n"
+        if @pending;
+}
+
+sub _snapshot_pf_passthrough_gpu_state {
+    my ($rec, $count) = @_;
+    if ($count > 0) {
+        my $snapshot = _snapshot_state($rec);
+        for my $vf (@{$snapshot->{drivers}}) {
+            die "Cannot resolve VF$vf->{vf_index} while snapshotting driver state\n"
+                if !defined($vf->{bdf});
+            my $override = read_sysfs(
+                "/sys/bus/pci/devices/$vf->{bdf}/driver_override"
+            );
+            die "Cannot snapshot driver_override for VF$vf->{vf_index} ($vf->{bdf})\n"
+                if !defined($override);
+            $vf->{override} = $override;
+        }
+        return $snapshot;
+    }
+
+    my $autoprobe = _read_uint_sysfs(
+        "/sys/bus/pci/devices/$rec->{bdf}/sriov_drivers_autoprobe",
+        "driver autoprobe state for $rec->{bdf}",
+    );
+    die "Invalid driver autoprobe state '$autoprobe' for $rec->{bdf}\n"
+        if $autoprobe !~ /^[01]$/;
+
+    return {
+        count => 0,
+        autoprobe => int($autoprobe),
+        scheduler => undef,
+        path_values => {},
+        drivers => [],
+        config => _snapshot_file($GPU_SRIOV_CONF),
+    };
+}
+
 sub _read_vfio_bdfs {
     my ($strict) = @_;
     return [] unless -f $VFIO_CONF;
@@ -2681,6 +3401,525 @@ sub _read_vfio_bdfs {
     my %seen;
     @bdfs = grep { !$seen{$_}++ } @bdfs;
     return \@bdfs;
+}
+
+# ---------------------------------------------------------------------------
+# AMD-IOMMU ATS safety policy
+# ---------------------------------------------------------------------------
+#
+# Battlemage B50 PF passthrough can hang an AMD host when PCI ATS is left
+# enabled.  Keep the policy state entirely read-only here: the helper owns
+# boot-loader configuration and is the only thing this API invokes for policy
+# changes.  In particular, none of the PF/VF or VM transaction code may run
+# until _assert_ats_safe_for_pf has returned successfully.
+sub _ats_policy_helper_path {
+    my $path = $ENV{PVE_GPU_ATS_POLICY_HELPER};
+    return defined($path) && $path ne ''
+        ? $path
+        : '/usr/lib/pve-gpu/manage-ats-policy.sh';
+}
+
+sub _read_host_file {
+    my ($path) = @_;
+    my $full = sysfs_path($path);
+    open(my $fh, '<', $full) or return (0, undef, "$!");
+    local $/;
+    my $contents = <$fh>;
+    my $closed = close($fh);
+    return (0, undef, "$!") if !$closed;
+    return (1, $contents // '', undef);
+}
+
+sub _ats_cpu_vendor {
+    my ($ok, $contents, $error) = _read_host_file('/proc/cpuinfo');
+    return ($contents =~ /^\s*vendor_id\s*:\s*(\S+)/mi)
+        ? $1
+        : ''
+        if $ok;
+    return '';
+}
+
+sub _ats_bool_from_value {
+    my ($value) = @_;
+    return undef if !defined($value);
+    return 1 if $value eq '1';
+    return 0 if $value eq '0';
+    return undef;
+}
+
+sub _ats_command_capture {
+    my ($command) = @_;
+    my ($stdout, $stderr, $exit_code) = ('', '', undef);
+    my $ok = eval {
+        $exit_code = run_command(
+            $command,
+            # PVE::Tools delivers callbacks one line at a time without the
+            # line ending.  Keep a separator so independent lspci/status
+            # lines cannot be joined into one token by the parser.  The
+            # callback guards also keep test doubles that pass undef benign.
+            outfunc => sub {
+                $stdout .= $_[0] . "\n" if defined($_[0]);
+            },
+            errfunc => sub {
+                $stderr .= $_[0] . "\n" if defined($_[0]);
+            },
+            noerr => 1,
+        );
+        1;
+    };
+    my $error = $@;
+    my $success = $ok && (!defined($exit_code) || $exit_code == 0);
+    return {
+        success   => $success ? 1 : 0,
+        exit_code => $exit_code,
+        stdout    => $stdout,
+        stderr    => $stderr,
+        error     => $error,
+    };
+}
+
+sub _ats_policy_identity {
+    my ($bdf) = @_;
+    $bdf = _normalise_bdf($bdf);
+    die "Invalid GPU BDF for ATS policy\n" if !defined($bdf);
+
+    my $vendor_raw = read_sysfs("/sys/bus/pci/devices/$bdf/vendor");
+    my $device_raw = read_sysfs("/sys/bus/pci/devices/$bdf/device");
+    my @identity_errors;
+    push @identity_errors, "Cannot read PCI vendor identity for $bdf"
+        if !defined($vendor_raw) || $vendor_raw !~ /^(?:0x)?[0-9a-fA-F]{4}$/;
+    push @identity_errors, "Cannot read PCI device identity for $bdf"
+        if !defined($device_raw) || $device_raw !~ /^(?:0x)?[0-9a-fA-F]{4}$/;
+
+    my $vendor = $vendor_raw // '';
+    my $device = $device_raw // '';
+    $vendor = lc($vendor);
+    $device = lc($device);
+    $vendor =~ s/^0x//;
+    $device =~ s/^0x//;
+
+    # A VF carries the same PCI device ID as its PF.  ATS policy is a PF
+    # policy only; never classify a VF as the affected B50 device.
+    my $is_pf = !-l sysfs_path("/sys/bus/pci/devices/$bdf/physfn");
+    my $is_b50_pf = $is_pf && $vendor eq '8086' && $device eq 'e212';
+    my $cpu_vendor = _ats_cpu_vendor();
+
+    # Missing CPU identity is treated as affected for a known B50 PF, but it
+    # also makes the safety state unknown below.  This keeps passthrough
+    # fail-closed if /proc/cpuinfo is masked or malformed; a known non-AMD
+    # CPU is explicitly outside this workaround.
+    my $cpu_is_amd = lc($cpu_vendor) eq 'authenticamd';
+    my $cpu_is_intel = lc($cpu_vendor) eq 'genuineintel';
+    my $cpu_unknown = !$cpu_is_amd && !$cpu_is_intel;
+    push @identity_errors, 'Cannot determine host CPU vendor'
+        if $is_b50_pf && $cpu_unknown;
+
+    # An unreadable PCI identity is not evidence that a BDF is harmless.  It
+    # is represented as affected so callers that gate writes fail closed;
+    # policy mutation still requires the exact known B50+AMD identity below.
+    my $hardware_identity_unknown = !defined($vendor_raw) ||
+        $vendor_raw !~ /^(?:0x)?[0-9a-fA-F]{4}$/ ||
+        !defined($device_raw) ||
+        $device_raw !~ /^(?:0x)?[0-9a-fA-F]{4}$/;
+    my $affected = (!$is_pf ? 0 : $hardware_identity_unknown)
+        || ($is_b50_pf && ($cpu_is_amd || $cpu_unknown));
+
+    return {
+        bdf        => $bdf,
+        vendor     => $vendor,
+        device     => $device,
+        is_pf      => $is_pf ? 1 : 0,
+        is_b50_pf  => $is_b50_pf ? 1 : 0,
+        cpu_vendor => $cpu_vendor,
+        identity_error => @identity_errors ? join('; ', @identity_errors) : undef,
+        affected   => $affected ? 1 : 0,
+    };
+}
+
+sub _ats_affected_b50_pfs {
+    my ($target_identity) = @_;
+    my %bdfs;
+    my @identity_errors;
+
+    # The no-ATS policy is host-wide, so disabling it must account for every
+    # affected PF, not only the BDF named by the request.  An unreadable PF
+    # might itself be another B50, so a host-wide policy removal must fail
+    # closed instead of silently excluding it from the consumer/driver scan.
+    my $devices = sysfs_path('/sys/bus/pci/devices');
+    opendir(my $devices_dh, $devices)
+        or die "Cannot safely remove the host-wide no-ATS policy because PCI devices cannot be enumerated at '$devices': $!\n";
+    my @device_entries = grep { $_ ne '.' && $_ ne '..' } readdir($devices_dh);
+    closedir($devices_dh)
+        or die "Cannot safely remove the host-wide no-ATS policy because PCI device enumeration could not be completed at '$devices': $!\n";
+    die "Cannot safely remove the host-wide no-ATS policy because PCI device enumeration returned no devices at '$devices'\n"
+        if !@device_entries;
+
+    for my $entry (sort @device_entries) {
+        my $candidate = _normalise_bdf($entry);
+        next if !defined($candidate);
+        my $identity = eval { _ats_policy_identity($candidate) };
+        if (!$identity) {
+            my $detail = $@ || 'identity probe returned no state';
+            $detail =~ s/\s+\z//;
+            push @identity_errors, "$candidate: $detail";
+            next;
+        }
+        if ($identity->{is_pf} &&
+            ($identity->{identity_error} // '') =~ /PCI (?:vendor|device) identity/i) {
+            # Unknown CPU identity is relevant only to an exact B50 PF and is
+            # already carried by its affected identity.  What makes a second
+            # arbitrary PF impossible to classify here is unreadable PCI
+            # vendor/device identity.
+            push @identity_errors, "$candidate: $identity->{identity_error}";
+            next;
+        }
+        next if !$identity->{is_b50_pf} || !$identity->{affected};
+        $bdfs{$identity->{bdf}} = 1;
+    }
+
+    die "Cannot safely remove the host-wide no-ATS policy because PCI PF identity is unknown: " .
+        join('; ', @identity_errors) . "\n"
+        if @identity_errors;
+
+    if ($target_identity && $target_identity->{is_b50_pf} &&
+        $target_identity->{affected}) {
+        $bdfs{$target_identity->{bdf}} = 1;
+    }
+
+    return \%bdfs;
+}
+
+sub _ats_active_noats {
+    my ($ok, $contents, $error) = _read_host_file('/proc/cmdline');
+    my $active = 0;
+    if ($ok) {
+        $active = scalar(grep { $_ eq 'pci=noats' } split(/\s+/, $contents // ''))
+            ? 1 : 0;
+    }
+    return {
+        active => $active,
+        error  => $ok ? undef : "Cannot read /proc/cmdline: $error",
+    };
+}
+
+sub _ats_lspci_state {
+    my ($bdf) = @_;
+    my $result = _ats_command_capture(['lspci', '-vv', '-s', $bdf]);
+    my $output = $result->{stdout} // '';
+    my $ats_supported = ($output =~ /^\s*ATSCap\s*:/mi ||
+        $output =~ /^\s*ATSCtl\s*:/mi) ? 1 : 0;
+
+    my ($enable, $disable) = (0, 0);
+    while ($output =~ /^\s*ATSCtl\s*:\s*([^\r\n]*)/gmi) {
+        my $line = $1;
+        $enable = 1 if $line =~ /\bEnable\+/i;
+        $disable = 1 if $line =~ /\bEnable-/i;
+    }
+
+    my $ats_enabled;
+    my $explicit_disabled = 0;
+    my $state_error;
+    if ($enable && !$disable) {
+        $ats_enabled = 1;
+    } elsif ($disable && !$enable) {
+        $ats_enabled = 0;
+        $explicit_disabled = 1;
+    } elsif ($enable && $disable) {
+        $state_error = 'lspci reported both ATSCtl Enable+ and Enable-';
+    } else {
+        $state_error = 'lspci did not report an explicit ATSCtl Enable+/Enable- state';
+    }
+
+    if (!$result->{success}) {
+        my $detail = $result->{error} || $result->{stderr} ||
+            (defined($result->{exit_code}) ? "exit $result->{exit_code}" : 'unknown failure');
+        $detail =~ s/\s+\z//;
+        $state_error = "lspci failed: $detail";
+    }
+
+    return {
+        ats_supported    => $ats_supported,
+        ats_enabled      => defined($ats_enabled) ? $ats_enabled : 0,
+        explicit_disabled => $explicit_disabled,
+        error            => $state_error,
+    };
+}
+
+sub _ats_helper_status {
+    my $helper = _ats_policy_helper_path();
+    my $result = _ats_command_capture([$helper, 'status']);
+    my %values;
+    for my $line (split(/\R/, $result->{stdout} // '')) {
+        $line =~ s/\r\z//;
+        $line =~ s/^\s+|\s+\z//g;
+        next if $line eq '' || $line =~ /^#/;
+        next if $line !~ /^([A-Za-z][A-Za-z0-9_.-]*)\s*=\s*(.*?)\s*\z/;
+        $values{lc($1)} = $2;
+    }
+
+    my $persistent_raw = $values{persistent_noats};
+    my $managed_raw = $values{managed};
+    my $boot_mode = $values{boot_mode} // '';
+    my $persistent = _ats_bool_from_value($persistent_raw);
+    my $managed = _ats_bool_from_value($managed_raw);
+    my @errors;
+    if (!$result->{success}) {
+        my $detail = $result->{error} || $result->{stderr} ||
+            (defined($result->{exit_code}) ? "exit $result->{exit_code}" : 'unknown failure');
+        $detail =~ s/\s+\z//;
+        push @errors, "ATS policy helper '$helper status' failed: $detail";
+    }
+    push @errors, 'ATS policy helper status requires canonical persistent_noats=0 or 1'
+        if !defined($persistent);
+    push @errors, 'ATS policy helper status requires canonical managed=0 or 1'
+        if !defined($managed);
+    push @errors, 'ATS policy helper status has an invalid boot_mode'
+        if $boot_mode !~ /^(?:grub|proxmox-boot-tool|systemd-boot)$/;
+
+    return {
+        boot_mode       => $boot_mode,
+        persistent_noats => defined($persistent) ? $persistent : 0,
+        managed         => defined($managed) ? $managed : 0,
+        helper_ok       => !@errors ? 1 : 0,
+        error           => @errors ? join('; ', @errors) : undef,
+        values          => \%values,
+    };
+}
+
+sub _ats_policy_state {
+    my ($bdf) = @_;
+    my $identity = _ats_policy_identity($bdf);
+    my $active = _ats_active_noats();
+    my $state = {
+        %$identity,
+        active_noats => $active->{active},
+        active_error => $active->{error},
+        ats_supported => 0,
+        ats_enabled => 0,
+        explicit_disabled => 0,
+        boot_mode => '',
+        persistent_noats => 0,
+        managed => 0,
+        helper_ok => 1,
+        helper_error => undef,
+        lspci_error => undef,
+        safe => 1,
+        reboot_required => 0,
+        reason => 'Device/CPU is outside the AMD ATS affected set',
+    };
+
+    my $lspci = _ats_lspci_state($identity->{bdf});
+    $state->{ats_supported} = $lspci->{ats_supported};
+    $state->{ats_enabled} = $lspci->{ats_enabled};
+    $state->{explicit_disabled} = $lspci->{explicit_disabled};
+    $state->{lspci_error} = $lspci->{error};
+
+    my $helper = _ats_helper_status();
+    $state->{boot_mode} = $helper->{boot_mode};
+    $state->{persistent_noats} = $helper->{persistent_noats};
+    $state->{managed} = $helper->{managed};
+    $state->{helper_ok} = $helper->{helper_ok};
+    $state->{helper_error} = $helper->{error};
+
+    $state->{safe} = $state->{active_noats} &&
+        $state->{explicit_disabled} &&
+        !$state->{lspci_error} &&
+        $state->{persistent_noats} &&
+        $state->{helper_ok} &&
+        !$state->{identity_error} ? 1 : 0;
+    # Any difference between the running and future boot policy needs a
+    # reboot to converge.  This also covers removing a managed policy while
+    # pci=noats is still active in the current kernel.
+    $state->{reboot_required} =
+        $state->{persistent_noats} != $state->{active_noats} ? 1 : 0;
+
+    # A known non-affected device is always safe for this B50 workaround,
+    # but still reports the live cmdline, lspci, and helper fields above so
+    # the GET contract is complete.
+    if (!$state->{affected}) {
+        # Keep the invariant on the internal state as well as the public
+        # response.  A failed optional helper probe must not turn an
+        # unrelated GPU into an ATS-gated device.
+        $state->{safe} = 1;
+        return $state;
+    }
+
+    my @reasons;
+    push @reasons, $state->{identity_error} if $state->{identity_error};
+    push @reasons, $state->{active_error} if $state->{active_error};
+    push @reasons, $state->{helper_error} if $state->{helper_error};
+    if (!$state->{active_noats} && $state->{persistent_noats}) {
+        push @reasons, 'persistent pci=noats policy is configured but not active; reboot is required';
+    } elsif ($state->{active_noats} && !$state->{persistent_noats}) {
+        push @reasons, 'pci=noats is active only for this boot and is not persistent; persist the policy first';
+    } elsif (!$state->{persistent_noats}) {
+        push @reasons, 'persistent pci=noats policy is not configured';
+    }
+    push @reasons, $state->{lspci_error} if $state->{lspci_error};
+    push @reasons, 'ATS is not explicitly disabled (ATSCtl Enable-)'
+        if !$state->{explicit_disabled};
+
+    if (@reasons) {
+        $state->{reason} = join('; ', @reasons) .
+            '. Enable the persistent no-ATS policy (pci=noats), reboot, and retry.';
+    } else {
+        $state->{reason} = 'pci=noats is active and persistent; ATS is explicitly disabled (ATSCtl Enable-)';
+    }
+
+    return $state;
+}
+
+sub _ats_policy_status_unlocked {
+    my ($bdf) = @_;
+    my $state = _ats_policy_state($bdf);
+    my $safe = $state->{affected}
+        ? ($state->{safe} ? 1 : 0)
+        : 1;
+    return {
+        affected        => $state->{affected} ? \1 : \0,
+        cpu_vendor      => $state->{cpu_vendor},
+        active_noats    => $state->{active_noats} ? \1 : \0,
+        ats_supported   => $state->{ats_supported} ? \1 : \0,
+        ats_enabled     => $state->{ats_enabled} ? \1 : \0,
+        boot_mode       => $state->{boot_mode} // '',
+        persistent_noats => $state->{persistent_noats} ? \1 : \0,
+        managed         => $state->{managed} ? \1 : \0,
+        safe            => $safe ? \1 : \0,
+        reboot_required => $state->{reboot_required} ? \1 : \0,
+        reason          => $state->{affected}
+            ? ($state->{reason} // 'ATS safety policy is not verified')
+            : 'Device/CPU is outside the AMD ATS affected set',
+    };
+}
+
+sub _ats_policy_status {
+    my ($bdf) = @_;
+    return _with_gpu_lock(sub {
+        _assert_power_mode_normal($bdf, 'read ATS policy');
+        return _ats_policy_status_unlocked($bdf);
+    });
+}
+
+# Publicly useful aliases for API tests and downstream callers that used the
+# older read_* naming while this policy was being developed.
+sub _read_ats_policy_status { return _ats_policy_status(@_); }
+sub _get_ats_policy_status { return _ats_policy_status(@_); }
+
+sub _assert_ats_safe_for_pf {
+    my ($bdf) = @_;
+    my $state = _ats_policy_state($bdf);
+    return $state if !$state->{affected} || $state->{safe};
+
+    my $reason = $state->{reason} //
+        'AMD ATS safety policy is not verified';
+    die "Refusing unsafe PF passthrough for $state->{bdf}: $reason\n";
+}
+
+sub _run_ats_policy_action {
+    my ($action) = @_;
+    die "Invalid ATS policy action\n"
+        if !defined($action) || $action !~ /^(?:enable|disable)$/;
+    my $helper = _ats_policy_helper_path();
+    my $result = _ats_command_capture([$helper, $action]);
+    return 1 if $result->{success};
+    my $detail = $result->{error} || $result->{stderr} ||
+        (defined($result->{exit_code}) ? "exit $result->{exit_code}" : 'unknown failure');
+    $detail =~ s/\s+\z//;
+    die "ATS policy helper '$helper $action' failed: $detail\n";
+}
+
+sub _enable_ats_policy {
+    my ($bdf) = @_;
+    return _with_gpu_lock(sub {
+        _assert_power_mode_normal($bdf, 'change ATS policy');
+        # Validate the target before invoking a helper so an accidental request
+        # cannot modify host boot policy for a malformed/non-PCI identifier.
+        my $identity = _ats_policy_identity($bdf);
+        die "The no-ATS workaround is only available for an Intel B50 PF (8086:e212) on an AuthenticAMD host\n"
+            if !$identity->{is_b50_pf} ||
+               lc($identity->{cpu_vendor} // '') ne 'authenticamd';
+        _run_ats_policy_action('enable');
+        return _ats_policy_status_unlocked($bdf);
+    });
+}
+
+sub _disable_ats_policy {
+    my ($bdf) = @_;
+
+    # Capture and validate the requested endpoint before taking the GPU lock.
+    # The host-wide device enumeration below is deliberately repeated while
+    # all mutation locks are held.  If sysfs disappears between these two
+    # probes, enumeration must report that uncertainty instead of degrading
+    # the target into a generic "not a B50" classification.
+    _assert_power_mode_normal($bdf, 'change ATS policy');
+    my $target_identity = _ats_policy_identity($bdf);
+    die "The no-ATS workaround is only available for an Intel B50 PF (8086:e212) on an AuthenticAMD host\n"
+        if !$target_identity->{is_b50_pf} ||
+           lc($target_identity->{cpu_vendor} // '') ne 'authenticamd';
+
+    return _with_gpu_lock(sub {
+        _assert_power_mode_normal($bdf, 'change ATS policy');
+
+        my @vmids = _all_qemu_vmids();
+        return _with_vm_locks(\@vmids, sub {
+            return _with_pci_reservation_lock(sub {
+                my $affected_pfs = _ats_affected_b50_pfs($target_identity);
+                my $initial = _ats_policy_state($bdf);
+
+                # The helper controls a host-wide boot argument.  Revalidate
+                # the endpoint after enumeration so identity changes cannot
+                # authorize removal using the earlier snapshot.
+                die "The no-ATS workaround is only available for an Intel B50 PF (8086:e212) on an AuthenticAMD host\n"
+                    if !$initial->{is_b50_pf} ||
+                       lc($initial->{cpu_vendor} // '') ne 'authenticamd';
+
+                # A failed status probe is not a reason to proceed with a
+                # destructive policy change: the helper may be absent,
+                # unreadable, or returning a partial status.  No GPU or VM
+                # mutation occurs on this path.
+                die "Cannot safely disable ATS policy for $initial->{bdf}: " .
+                    ($initial->{helper_error} // 'ATS policy status is unavailable') . "\n"
+                    if !$initial->{helper_ok};
+
+                if ($initial->{affected}) {
+                    my $consumers = _scan_qemu_pci_consumers(
+                        $affected_pfs,
+                        1,
+                    );
+                    my @pf_consumers = grep {
+                        $affected_pfs->{$_->{bdf}}
+                    } @$consumers;
+                    if (@pf_consumers) {
+                        my $who = join(', ', map {
+                            "B50 PF $_->{bdf} consumed by VM $_->{vmid} ($_->{key})"
+                        } @pf_consumers);
+                        die "Cannot disable ATS policy for $initial->{bdf}: " .
+                            "an affected B50 PF is still consumed by $who; detach it first\n";
+                    }
+
+                    my $vfio_bdfs = _read_vfio_bdfs(1);
+                    my @persistent_pfs = grep { $affected_pfs->{$_} } @$vfio_bdfs;
+                    if (@persistent_pfs) {
+                        die "Cannot disable ATS policy for $initial->{bdf}: " .
+                            "a VFIO persistent policy still names affected B50 PF " .
+                            join(', ', @persistent_pfs) .
+                            "; unbind it and remove the persistence entry first\n";
+                    }
+
+                    for my $affected_bdf (sort keys %$affected_pfs) {
+                        my $driver = _pci_driver($affected_bdf);
+                        die "Cannot disable ATS policy for $initial->{bdf}: " .
+                            "affected B50 PF $affected_bdf is still bound to vfio-pci; " .
+                            "bind it back to xe first\n"
+                            if $driver eq 'vfio-pci';
+                    }
+                }
+
+                _run_ats_policy_action('disable');
+                return _ats_policy_status_unlocked($initial->{bdf});
+            });
+        });
+    });
 }
 
 sub _set_vfio_configured {
@@ -2716,6 +3955,297 @@ sub _set_vfio_configured {
     return 1;
 }
 
+sub _switch_to_pf_passthrough {
+    my ($bdf, $target_vmid) = @_;
+    $bdf = _normalise_bdf($bdf);
+    die "Invalid physical GPU BDF\n" if !defined($bdf);
+    $target_vmid = int($target_vmid // 0);
+    die "A valid target QEMU VM ID is required\n" if $target_vmid < 1;
+
+    return _with_gpu_lock(sub {
+        _assert_power_mode_normal($bdf, 'enable whole-GPU passthrough');
+        my @vmids = _all_qemu_vmids();
+        my %known_vmid = map { $_ => 1 } @vmids;
+        die "QEMU VM $target_vmid does not exist on this node\n"
+            if !$known_vmid{$target_vmid};
+
+        return _with_vm_locks(\@vmids, sub {
+            return _with_pci_reservation_lock(sub {
+                my $rec = _collect_device($bdf, 0);
+                die "Device '$bdf' not found or not a supported GPU\n"
+                    if !defined($rec);
+                die "Refusing to switch a PCI VF as though it were a physical GPU\n"
+                    if -l sysfs_path("/sys/bus/pci/devices/$bdf/physfn");
+
+                # This is deliberately before every topology, driver,
+                # persistence, or VM configuration write below.  The check
+                # itself is read-only and fails closed for the affected
+                # B50/AMD-IOMMU combination.
+                _assert_ats_safe_for_pf($bdf);
+
+                my @current_vmids = _all_qemu_vmids();
+                die "The QEMU VM set changed while preparing whole-GPU passthrough; retry the operation\n"
+                    if join(',', @current_vmids) ne join(',', @vmids);
+
+                my $num_vfs = _read_sriov_numvfs(
+                    $bdf,
+                    "VF count for $bdf",
+                );
+                my %gpu_bdfs = ($bdf => 1);
+                for my $vf_index (1 .. $num_vfs) {
+                    my $vf_bdf = _validate_vf_bdf($rec, $vf_index);
+                    $gpu_bdfs{$vf_bdf} = 1;
+                }
+
+                my $consumers = _scan_qemu_pci_consumers(\%gpu_bdfs, 1);
+                for my $consumer (@$consumers) {
+                    die "VM $consumer->{vmid} became a PCI consumer after the VM lock set was acquired; retry the operation\n"
+                        if !$known_vmid{$consumer->{vmid}};
+                }
+                my %affected_vmids = ($target_vmid => 1);
+                $affected_vmids{$_->{vmid}} = 1 for @$consumers;
+
+                my (%configs, %snapshots);
+                for my $vmid (sort { $a <=> $b } keys %affected_vmids) {
+                    my $conf = PVE::QemuConfig->load_config($vmid);
+                    $configs{$vmid} = $conf;
+                    $snapshots{$vmid} = dclone($conf);
+                }
+
+                my %consumer_keys;
+                for my $consumer (@$consumers) {
+                    my $identity = "$consumer->{vmid}|$consumer->{key}";
+                    $consumer_keys{$identity} = {
+                        vmid => int($consumer->{vmid}),
+                        key => $consumer->{key},
+                    };
+                }
+
+                for my $entry (values %consumer_keys) {
+                    my ($vmid, $key) = @$entry{qw(vmid key)};
+                    die "VM $vmid no longer contains $key; retry the operation\n"
+                        if !exists($configs{$vmid}{$key});
+                    _assert_exact_gpu_hostpci_entry(
+                        $vmid,
+                        $key,
+                        $configs{$vmid}{$key},
+                        \%gpu_bdfs,
+                    );
+                }
+
+                my $preserved_target_key;
+                my @pf_consumers = grep { $_->{bdf} eq $bdf } @$consumers;
+                if (@pf_consumers == 1 &&
+                    int($pf_consumers[0]{vmid}) == $target_vmid) {
+                    my $key = $pf_consumers[0]{key};
+                    my $value = $configs{$target_vmid}{$key};
+                    if (defined($value) && $value !~ /(?:^|,)mapping=/) {
+                        my @resolved = _resolve_hostpci_bdfs($value, 1);
+                        $preserved_target_key = $key
+                            if @resolved == 1 && $resolved[0] eq $bdf;
+                    }
+                }
+
+                my $current_driver = _pci_driver($bdf);
+                die "Refusing to switch physical GPU $bdf from unsupported current driver '" .
+                    ($current_driver || 'unbound') . "'\n"
+                    if $current_driver !~ /^(?:xe|vfio-pci)$/;
+                die "Active VFs on $bdf require the xe PF driver before whole-GPU passthrough\n"
+                    if $num_vfs > 0 && $current_driver ne 'xe';
+
+                my $override = read_sysfs(
+                    "/sys/bus/pci/devices/$bdf/driver_override"
+                );
+                die "Cannot snapshot driver_override for physical GPU $bdf\n"
+                    if !defined($override);
+                my $normal_override = $override eq '(null)' ? '' : $override;
+                my $driver_changes = $current_driver ne 'vfio-pci' ||
+                    $normal_override ne '';
+
+                my $sriov_config = parse_ini_config($GPU_SRIOV_CONF, 1);
+                my @sriov_profiles = grep { /^\Q$bdf\E\/vf\d+$/ } keys %$sriov_config;
+                my $sriov_persistence_present =
+                    exists($sriov_config->{$bdf}) || @sriov_profiles;
+                my $vfio_bdfs = _read_vfio_bdfs(1);
+                my $vfio_configured = grep { $_ eq $bdf } @$vfio_bdfs;
+
+                if (defined($preserved_target_key) && @$consumers == 1 &&
+                    $num_vfs == 0 && !$driver_changes &&
+                    !$sriov_persistence_present && $vfio_configured) {
+                    _assert_vm_can_verify_pf_passthrough(
+                        $target_vmid,
+                        $configs{$target_vmid},
+                    );
+                    return {
+                        success => \1,
+                        changed => \0,
+                        bdf => $bdf,
+                        vmid => $target_vmid,
+                        hostpci => $preserved_target_key,
+                        driver => 'vfio-pci',
+                        sriov_numvfs => 0,
+                        vfio_configured => \1,
+                        detached_vmids => [],
+                        reboot_required => \0,
+                    };
+                }
+
+                _assert_vm_can_change_pf_passthrough($_, $configs{$_})
+                    for sort { $a <=> $b } keys %affected_vmids;
+
+                my (%changed_vmids, %detached_vmids);
+                for my $identity (sort keys %consumer_keys) {
+                    my $entry = $consumer_keys{$identity};
+                    my ($vmid, $key) = @$entry{qw(vmid key)};
+                    next if defined($preserved_target_key) &&
+                        $vmid == $target_vmid && $key eq $preserved_target_key;
+                    delete $configs{$vmid}{$key};
+                    $changed_vmids{$vmid} = 1;
+                    $detached_vmids{$vmid} = 1;
+                }
+
+                my $target_key = $preserved_target_key;
+                if (!defined($target_key)) {
+                    $target_key = _first_free_hostpci_key($configs{$target_vmid});
+                    $configs{$target_vmid}{$target_key} = _format_pf_hostpci_value(
+                        $configs{$target_vmid},
+                        $bdf,
+                    );
+                    $changed_vmids{$target_vmid} = 1;
+                }
+
+                my @changed_vmids = sort { $a <=> $b } keys %changed_vmids;
+                _validate_qemu_hostpci_config($_, $configs{$_}) for @changed_vmids;
+
+                my $gpu_snapshot = _snapshot_pf_passthrough_gpu_state(
+                    $rec,
+                    $num_vfs,
+                );
+                my $vfio_snapshot = _snapshot_file($VFIO_CONF);
+                my ($gpu_state_touched, $topology_touched, $driver_touched,
+                    $vfio_touched) = (0, 0, 0, 0);
+                my @vm_write_attempted;
+
+                my $ok = eval {
+                    if ($num_vfs > 0) {
+                        $gpu_state_touched = 1;
+                        $topology_touched = 1;
+                        _set_autoprobe($bdf, 0);
+                        _unbind_all_vfs($bdf, $num_vfs);
+                        write_sysfs("/sys/bus/pci/devices/$bdf/sriov_numvfs", 0);
+                        my $actual_count = _read_sriov_numvfs(
+                            $bdf,
+                            "whole-GPU VF removal verification for $bdf",
+                        );
+                        die "VF removal verification failed: sriov_numvfs=$actual_count\n"
+                            if $actual_count != 0;
+                    }
+
+                    if ($sriov_persistence_present) {
+                        $gpu_state_touched = 1;
+                        _remove_persisted_config($bdf);
+                    }
+
+                    if ($driver_changes) {
+                        $driver_touched = 1;
+                        _set_vf_driver_state($bdf, 'vfio-pci');
+                    }
+                    if (!$vfio_configured) {
+                        $vfio_touched = 1;
+                        _set_vfio_configured($bdf, 1);
+                    }
+
+                    for my $vmid (@changed_vmids) {
+                        push @vm_write_attempted, $vmid;
+                        PVE::QemuConfig->write_config($vmid, $configs{$vmid});
+                    }
+
+                    my $actual_count = _read_sriov_numvfs(
+                        $bdf,
+                        "whole-GPU final VF count for $bdf",
+                    );
+                    die "Whole-GPU passthrough requires sriov_numvfs=0 (found $actual_count)\n"
+                        if $actual_count != 0;
+                    my $actual_driver = _pci_driver($bdf);
+                    die "Physical GPU driver verification failed: expected 'vfio-pci', found '" .
+                        ($actual_driver || 'unbound') . "'\n"
+                        if $actual_driver ne 'vfio-pci';
+                    my $actual_override = read_sysfs(
+                        "/sys/bus/pci/devices/$bdf/driver_override"
+                    );
+                    $actual_override = '' if defined($actual_override) &&
+                        $actual_override eq '(null)';
+                    die "Physical GPU driver_override was not cleared for $bdf\n"
+                        if !defined($actual_override) || $actual_override ne '';
+
+                    my $actual_vfio = _read_vfio_bdfs(1);
+                    die "VFIO persistence verification failed for $bdf\n"
+                        if !grep { $_ eq $bdf } @$actual_vfio;
+                    my $actual_sriov = parse_ini_config($GPU_SRIOV_CONF, 1);
+                    my @actual_profiles = grep { /^\Q$bdf\E\/vf\d+$/ } keys %$actual_sriov;
+                    die "SR-IOV persistence removal verification failed for $bdf\n"
+                        if exists($actual_sriov->{$bdf}) || @actual_profiles;
+
+                    my $after_consumers = _scan_qemu_pci_consumers(\%gpu_bdfs, 1);
+                    die "Whole-GPU VM assignment verification failed for VM $target_vmid\n"
+                        if @$after_consumers != 1 ||
+                           $after_consumers->[0]{bdf} ne $bdf ||
+                           int($after_consumers->[0]{vmid}) != $target_vmid ||
+                           $after_consumers->[0]{key} ne $target_key;
+                    1;
+                };
+
+                if (!$ok) {
+                    my $error = $@ || 'unknown whole-GPU passthrough failure';
+                    my @rollback_errors;
+                    if ($driver_touched) {
+                        eval {
+                            _restore_vf_driver_state(
+                                $bdf,
+                                $current_driver,
+                                $override,
+                            )
+                        };
+                        push @rollback_errors, "GPU driver: $@" if $@;
+                    }
+                    if ($vfio_touched) {
+                        eval { _restore_file_snapshot($VFIO_CONF, $vfio_snapshot) };
+                        push @rollback_errors, "VFIO persistence: $@" if $@;
+                    }
+                    if ($gpu_state_touched) {
+                        my $gpu_errors = _rollback_state(
+                            $rec,
+                            $gpu_snapshot,
+                            $topology_touched,
+                        );
+                        push @rollback_errors, @$gpu_errors;
+                    }
+                    push @rollback_errors, _rollback_qemu_configs(
+                        \%snapshots,
+                        \@vm_write_attempted,
+                    ) if @vm_write_attempted;
+                    $error .= "Rollback also failed: " . join('; ', @rollback_errors) . "\n"
+                        if @rollback_errors;
+                    die $error;
+                }
+
+                return {
+                    success => \1,
+                    changed => \1,
+                    bdf => $bdf,
+                    vmid => $target_vmid,
+                    hostpci => $target_key,
+                    driver => 'vfio-pci',
+                    sriov_numvfs => 0,
+                    vfio_configured => \1,
+                    detached_vmids => [sort { $a <=> $b } keys %detached_vmids],
+                    reboot_required => \0,
+                };
+            });
+        });
+    });
+}
+
 sub _set_pf_driver {
     my ($bdf, $target_driver) = @_;
     $bdf = _normalise_bdf($bdf);
@@ -2724,6 +4254,7 @@ sub _set_pf_driver {
         if $target_driver !~ /^(?:xe|vfio-pci)$/;
 
     return _with_gpu_lock(sub {
+        _assert_power_mode_normal($bdf, 'switch the physical GPU driver');
         my @vmids = _all_qemu_vmids();
         return _with_vm_locks(\@vmids, sub {
             return _with_pci_reservation_lock(sub {
@@ -2732,6 +4263,12 @@ sub _set_pf_driver {
                     if !defined($rec);
                 die "Refusing to switch a PCI VF as though it were a physical GPU\n"
                     if -l sysfs_path("/sys/bus/pci/devices/$bdf/physfn");
+
+                # Binding a PF to vfio-pci is just as dangerous as the
+                # whole-PF convenience transaction.  Keep unbind-to-xe
+                # available as a recovery path, even while ATS is unsafe.
+                _assert_ats_safe_for_pf($bdf)
+                    if $target_driver eq 'vfio-pci';
 
                 my @current_vmids = _all_qemu_vmids();
                 die "The QEMU VM set changed while preparing the driver switch; retry the operation\n"
@@ -2850,6 +4387,135 @@ sub _set_pf_driver {
 }
 
 __PACKAGE__->register_method({
+    name        => 'ats_policy_status',
+    path        => '{bdf}/ats-policy',
+    method      => 'GET',
+    description => 'Report the AMD-IOMMU ATS safety policy for a GPU PF.',
+    permissions => {
+        check => ['perm', '/nodes/{node}', ['Sys.Audit']],
+    },
+    protected => 1,
+    proxyto   => 'node',
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => get_standard_option('pve-node'),
+            bdf => {
+                type => 'string',
+                description => 'PCI BDF address',
+                pattern => $BDF_RE,
+            },
+        },
+    },
+    returns => { type => 'object' },
+    code => sub {
+        my ($param) = @_;
+        return _ats_policy_status($param->{bdf});
+    },
+});
+
+__PACKAGE__->register_method({
+    name        => 'enable_ats_policy',
+    path        => '{bdf}/ats-policy',
+    method      => 'POST',
+    description => 'Persist the no-ATS boot policy; this endpoint never reboots the node.',
+    permissions => {
+        check => ['perm', '/nodes/{node}', ['Sys.Modify']],
+    },
+    protected => 1,
+    proxyto   => 'node',
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => get_standard_option('pve-node'),
+            bdf => {
+                type => 'string',
+                description => 'PCI BDF address',
+                pattern => $BDF_RE,
+            },
+        },
+    },
+    returns => { type => 'object' },
+    code => sub {
+        my ($param) = @_;
+        my $rpcenv = PVE::RPCEnvironment->get();
+        my $authuser = $rpcenv->get_user();
+        die "Only root\@pam may change the ATS policy\n"
+            if !defined($authuser) || $authuser ne 'root@pam';
+        return _enable_ats_policy($param->{bdf});
+    },
+});
+
+__PACKAGE__->register_method({
+    name        => 'disable_ats_policy',
+    path        => '{bdf}/ats-policy',
+    method      => 'DELETE',
+    description => 'Remove the no-ATS boot policy after checking PF consumers; this endpoint never reboots the node.',
+    permissions => {
+        check => ['perm', '/nodes/{node}', ['Sys.Modify']],
+    },
+    protected => 1,
+    proxyto   => 'node',
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => get_standard_option('pve-node'),
+            bdf => {
+                type => 'string',
+                description => 'PCI BDF address',
+                pattern => $BDF_RE,
+            },
+        },
+    },
+    returns => { type => 'object' },
+    code => sub {
+        my ($param) = @_;
+        my $rpcenv = PVE::RPCEnvironment->get();
+        my $authuser = $rpcenv->get_user();
+        die "Only root\@pam may change the ATS policy\n"
+            if !defined($authuser) || $authuser ne 'root@pam';
+        return _disable_ats_policy($param->{bdf});
+    },
+});
+
+__PACKAGE__->register_method({
+    name        => 'quick_pf_passthrough',
+    path        => '{bdf}/passthrough',
+    method      => 'POST',
+    description => 'Detach every stopped PF/VF consumer, remove SR-IOV, and assign the whole physical GPU to one stopped QEMU VM transactionally.',
+    permissions => {
+        check => ['perm', '/nodes/{node}', ['Sys.Modify']],
+    },
+    protected => 1,
+    proxyto   => 'node',
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => get_standard_option('pve-node'),
+            bdf  => {
+                type        => 'string',
+                description => 'PCI BDF address of the physical GPU',
+                pattern     => $BDF_RE,
+            },
+            vmid => {
+                type        => 'integer',
+                description => 'Stopped and unlocked target QEMU VM ID',
+                minimum     => 1,
+            },
+        },
+    },
+    returns => { type => 'object' },
+    code => sub {
+        my ($param) = @_;
+        my $rpcenv = PVE::RPCEnvironment->get();
+        my $authuser = $rpcenv->get_user();
+        die "Only root\@pam may move raw PF/VF PCI functions between VMs\n"
+            if !defined($authuser) || $authuser ne 'root@pam';
+        return _switch_to_pf_passthrough($param->{bdf}, $param->{vmid});
+    },
+});
+
+__PACKAGE__->register_method({
     name        => 'vfio_toggle',
     path        => '{bdf}/vfio',
     method      => 'POST',
@@ -2923,10 +4589,13 @@ __PACKAGE__->register_method({
     },
     code => sub {
         my ($param) = @_;
-        my $rec = _collect_device($param->{bdf}, 0);
-        die "Device '$param->{bdf}' not found or not a supported GPU\n"
-            if !defined($rec);
-        return _vf_records($rec);
+        return _with_gpu_lock(sub {
+            _assert_power_mode_normal($param->{bdf}, 'read the VF list');
+            my $rec = _collect_device($param->{bdf}, 0);
+            die "Device '$param->{bdf}' not found or not a supported GPU\n"
+                if !defined($rec);
+            return _vf_records($rec);
+        });
     },
 });
 
@@ -2959,9 +4628,11 @@ __PACKAGE__->register_method({
     returns => { type => 'object' },
     code => sub {
         my ($param) = @_;
-        my $rec = _collect_device($param->{bdf}, 0);
-        die "Device '$param->{bdf}' not found or not a supported GPU\n"
-            if !defined($rec);
+        return _with_gpu_lock(sub {
+            _assert_power_mode_normal($param->{bdf}, 'read VF details');
+            my $rec = _collect_device($param->{bdf}, 0);
+            die "Device '$param->{bdf}' not found or not a supported GPU\n"
+                if !defined($rec);
 
         my $wanted = int($param->{vfIndex});
         my $vfs = _vf_records($rec);
@@ -2969,13 +4640,14 @@ __PACKAGE__->register_method({
         die "VF index $wanted out of range (1.." . scalar(@$vfs) . ")\n"
             if !defined($vf);
 
-        return {
-            %$vf,
-            pf_bdf => $rec->{bdf},
-            family => $rec->{family},
-            tiles => int($rec->{tiles}),
-            scheduler_priority => _read_scheduler_priority($rec),
-        };
+            return {
+                %$vf,
+                pf_bdf => $rec->{bdf},
+                family => $rec->{family},
+                tiles => int($rec->{tiles}),
+                scheduler_priority => _read_scheduler_priority($rec),
+            };
+        });
     },
 });
 
@@ -3023,6 +4695,75 @@ __PACKAGE__->register_method({
             $param->{vfIndex},
             $param->{vmid},
         );
+    },
+});
+
+__PACKAGE__->register_method({
+    name        => 'power_policy_status',
+    path        => '{bdf}/power-policy',
+    method      => 'GET',
+    description => 'Report the runtime-only Intel B50 deep-idle policy and its blockers.',
+    permissions => {
+        check => ['perm', '/nodes/{node}', ['Sys.Audit']],
+    },
+    protected => 1,
+    proxyto => 'node',
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => get_standard_option('pve-node'),
+            bdf => {
+                type => 'string',
+                description => 'PCI BDF address of the physical GPU',
+                pattern => $BDF_RE,
+            },
+        },
+    },
+    returns => { type => 'object' },
+    code => sub {
+        my ($param) = @_;
+        return _with_gpu_lock(sub {
+            return _power_policy_status($param->{bdf});
+        });
+    },
+});
+
+__PACKAGE__->register_method({
+    name        => 'change_power_policy',
+    path        => '{bdf}/power-policy',
+    method      => 'POST',
+    description => 'Enter or exit runtime-only Intel B50 deep idle transactionally.',
+    permissions => {
+        check => ['perm', '/nodes/{node}', ['Sys.Modify']],
+    },
+    protected => 1,
+    proxyto => 'node',
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => get_standard_option('pve-node'),
+            bdf => {
+                type => 'string',
+                description => 'PCI BDF address of the physical GPU',
+                pattern => $BDF_RE,
+            },
+            action => {
+                type => 'string',
+                description => 'Enter or exit runtime-only deep idle',
+                enum => ['enter', 'exit'],
+            },
+        },
+    },
+    returns => { type => 'object' },
+    code => sub {
+        my ($param) = @_;
+        my $rpcenv = PVE::RPCEnvironment->get();
+        my $authuser = $rpcenv->get_user();
+        die "Only root\@pam may change raw GPU power state\n"
+            if !defined($authuser) || $authuser ne 'root@pam';
+        return $param->{action} eq 'enter'
+            ? _enter_deep_idle($param->{bdf})
+            : _exit_deep_idle($param->{bdf});
     },
 });
 

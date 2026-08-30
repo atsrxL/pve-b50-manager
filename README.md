@@ -45,6 +45,17 @@ only for the pre-creation state where VF directories do not yet exist.
 - Double-clicking a VF's VM cell assigns it to a stopped QEMU VM, moves it, or
   leaves it unassigned. Assignment also binds the VF to vfio-pci explicitly,
   which is required while sriov_drivers_autoprobe is disabled.
+- Quick Whole-GPU Passthrough replaces every VF assignment with one PF
+  assignment: select a stopped QEMU VM, confirm the transaction, and the plugin
+  removes this GPU's VFs and persistent profiles before binding the PF to
+  vfio-pci and adding it to the selected VM.
+- On AuthenticAMD hosts, the B50 PF view reports the active, persistent, and
+  live ATS state. The UI can prepare or remove the package-owned `pci=noats`
+  boot policy; it never reboots the node automatically.
+- The B50 Power Saving dialog can temporarily park all VFs, keep their VM
+  hostpci entries and persistent profiles, and apply the tested 10 ms runtime
+  autosuspend delay. It uses the stock xe driver and does not require a custom
+  kernel.
 
 auto never means “write quota 0”. Switching an existing custom resource back to
 auto requires a VF reprovision so the driver can calculate it again.
@@ -75,6 +86,33 @@ verification.
   unexpectedly recreate them.
 - Multiple persistent PFs are validated before the first hardware write. If a
   later PF fails, already-applied PFs are rolled back in reverse order.
+- The whole-GPU quick mode locks every QEMU configuration and PVE's PCI
+  reservation state before changing anything. Every affected VM must be
+  stopped and unlocked. On failure it restores the PF driver, VFIO policy,
+  SR-IOV topology and profiles, and the original VM configurations.
+- Whole-GPU quick mode changes only the selected GPU PF and its VFs. Separate
+  audio functions and unrelated PCI devices are neither detached nor moved.
+  After the ATS safety state is verified, selecting the VM that already owns a
+  correctly configured PF is a no-op, including while that VM is running.
+- On an AuthenticAMD host, passthrough of the physical `8086:e212` B50 is
+  rejected before any topology, driver, persistence, or VM write unless the
+  running command line contains the exact `pci=noats` token, the future boot
+  policy is persistent, and `lspci` reports `ATSCtl: Enable-`. Unknown PCI or
+  CPU identity fails closed; VFs and unrelated devices are outside this guard.
+- Native `qm`, API, and HA starts run a full hostpci preflight before PVE
+  reserves or prepares any PCI function. A second low-level check protects
+  direct `prepare_pci_device` callers and `driver=keep` configurations.
+- The boot binders are ordered before `pve-guests`; failed binders or missing
+  native start guards prevent automatic guest startup.
+- B50 power saving requires the PF to remain on xe and every GPU consumer VM
+  to be stopped. A live VF topology also requires a complete, drift-free
+  persistent profile before any VF is removed.
+- While VFs are parked, native QEMU starts, direct SR-IOV/VFIO/ATS writes, and
+  wake-up status probes fail closed. The device list reports sleeping state
+  using only non-waking runtime-power attributes.
+- Explicit exit rebuilds the exact VF count and BDF topology, reapplies resource
+  profiles, scheduler and drivers, restores the prior autosuspend settings, and
+  clears the runtime recovery record only after verification succeeds.
 
 The low scheduler profile is the recommended B50 default. normal is exposed as
 an experimental option only: it requires an explicit confirmation and is
@@ -103,10 +141,10 @@ dpkg -i ../pve-gpu-manager_*.deb
 ~~~
 
 Installation adds a GPU section under the selected PVE node. The package applies
-small, owned marker blocks to the PVE hardware API index and web template.
-Reapplying the integration is idempotent. Package removal removes only those
-marker blocks; it does not restore an old whole-file backup over upgraded PVE
-files.
+small, owned marker blocks to the PVE hardware API index, web template, and the
+two QemuServer start boundaries used for native ATS and parked-VF checks. Reapplying the
+integration is idempotent. Package removal removes only those marker blocks; it
+does not restore an old whole-file backup over upgraded PVE files.
 
 On upgrade, legacy uniform SR-IOV profiles are migrated to explicit v2 per-VF
 profiles before boot restore is enabled. Obsolete package-owned global VFIO
@@ -117,12 +155,47 @@ integration are used immediately. Other kernel arguments are retained. The
 upgrade does not start the VFIO or SR-IOV boot services and therefore does not
 change live GPU topology.
 
+Awaited dpkg file triggers replay the marker integrations when qemu-server or
+pve-manager replaces their files, including a normal direct `dpkg -i` update.
+Do not use `dpkg --no-triggers` or start VMs concurrently while dpkg is unpacking
+qemu-server; those exceptional paths bypass the trigger completion guarantee.
+
+### AMD B50 ATS workflow
+
+For the affected physical B50 on an AuthenticAMD host:
+
+1. Read `/{bdf}/ats-policy` to inspect the live and future-boot state.
+2. POST the endpoint to create the package-owned persistent `pci=noats` policy.
+   Existing external policy is accepted but never claimed or edited.
+3. Reboot only when `reboot_required` is true, then verify `safe=true` before
+   assigning or starting the PF.
+4. DELETE removes only package-owned policy and is rejected while any affected
+   B50 PF remains assigned, persistently selected for VFIO, or bound to
+   `vfio-pci`.
+
+### B50 runtime power-saving workflow
+
+1. Keep the B50 PF on xe, stop every VM which owns one of its VFs, and make sure
+   the current VF profile is persisted without drift.
+2. Select the B50 and open **Power Saving**. Entering the mode removes only the
+   live VF functions, preserves VM hostpci configuration and `gpu-sriov.conf`,
+   sets runtime power control to `auto` with a 10 ms delay, and verifies runtime
+   suspend plus PCI D3.
+3. Telemetry, ATS and VF status reads which could wake the GPU remain paused.
+   VM starts and conflicting GPU changes are rejected with an instruction to
+   exit Power Saving.
+4. Use **Exit Power Saving** to restore and verify the saved topology. This mode
+   is deliberately runtime-only: a host reboot drops the `/run` recovery record,
+   and the ordinary persistent SR-IOV boot restore recreates the VFs before
+   guests start.
+
 Do not install a development build on a production node without first reviewing
 the generated package and taking a current PVE configuration backup.
 
 ## Dependencies
 
 - Proxmox VE 8.x or 9.x
+- qemu-server 8.x or 9.x
 - Perl and libpve-common-perl
 - pciutils
 - linux-perf for optional telemetry
@@ -143,7 +216,13 @@ Endpoints are under /api2/json/nodes/{node}/hardware/gpu:
 | GET | /{bdf}/vf | List live VFs and resources |
 | GET | /{bdf}/vf/{index} | Read one VF |
 | PUT | /{bdf}/vf/{index}/assignment | Assign/move a VF to a stopped QEMU VM; vmid=0 clears it |
+| POST | /{bdf}/passthrough | Replace all stopped VF/PF consumers with one whole-PF VM assignment |
 | POST | /{bdf}/vfio | Switch the PF between xe and vfio-pci with safety guards |
+| GET | /{bdf}/ats-policy | Read active, persistent, and live ATS safety state |
+| POST | /{bdf}/ats-policy | Prepare persistent pci=noats policy without rebooting |
+| DELETE | /{bdf}/ats-policy | Remove package-owned policy after affected PFs are released |
+| GET | /{bdf}/power-policy | Read B50 runtime power state, blockers, and non-waking suspend status |
+| POST | /{bdf}/power-policy | Enter or exit transactional runtime-only B50 power saving |
 
 The SR-IOV POST accepts a JSON-encoded vf_profiles array. Every persistent profile
 must explicitly choose auto or custom for all resources.
@@ -195,12 +274,18 @@ available and exercises a same-count B50 profile transaction against an isolated
 fake sysfs/config tree. It is skipped on non-PVE machines.
 
 t/09-vf-assignment.t exercises stopped-VM VF assignment, movement, removal,
-driver reconciliation, conflict handling, and rollback when PVE libraries are
+whole-PF conversion and movement, running same-target no-op behavior, driver
+reconciliation, conflict handling, and rollback when PVE libraries are
 available.
 
 t/10-sriov-boot-rollback.t covers multi-PF rollback, legacy-profile migration,
 and PF/VF scheduler consistency under Bash 4 or newer. t/11-frontend-logic.t
 covers request ownership and the live-versus-persisted UI state.
+t/12-ats-policy.t covers GRUB/proxmox-boot-tool ownership and rollback plus the
+boot binder gate. t/13-native-ats-guard.t covers affected-device identity,
+active/future ATS policy, full hostpci preflight, and marker replay/removal.
+t/14-power-policy.t covers atomic runtime state, native VM-start rejection,
+PCI mappings, malformed-state fail-closed behavior, and multi-PF isolation.
 
 Project layout:
 
@@ -208,6 +293,7 @@ Project layout:
 src/PVE/API2/Hardware/GPU.pm        REST API and transactions
 src/PVE/API2/Hardware/GPU/Intel.pm  Intel ABI adapter
 src/PVE/GPU/SRIOV.pm                profile parsing and validation
+src/PVE/GPU/Power.pm                runtime state and native VM-start guard
 src/js/pve-gpu-plugin.js            ExtJS node UI
 src/scripts/                        boot restore and integration helpers
 src/systemd/                        boot ordering

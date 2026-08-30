@@ -1,3 +1,74 @@
+pve-gpu-manager (1.1.0-12) stable; urgency=medium
+
+  * Remove stale versioned web-plugin markers during package upgrades
+  * Prevent duplicate GPU navigation registration from blanking node pages
+  * Add cross-version marker migration coverage for inline PVE templates
+
+ -- PVE GPU Manager <pve-gpu@localhost>  Sun, 30 Aug 2026 16:35:00 +0800
+
+pve-gpu-manager (1.1.0-11) stable; urgency=medium
+
+  * Preserve active boot-restore oneshot state across package upgrades
+  * Keep upgrades from rerunning or deactivating live GPU topology services
+  * Refresh the web plugin cache tag for the reviewed deployment
+
+ -- PVE GPU Manager <pve-gpu@localhost>  Sun, 30 Aug 2026 12:36:00 +0800
+
+pve-gpu-manager (1.1.0-10) stable; urgency=medium
+
+  * Add runtime-only Intel Arc Pro B50 power saving on the stock xe driver
+  * Park live VFs, apply the tested 10 ms autosuspend delay, and verify D3 idle
+  * Restore verified VF profiles and drivers transactionally on explicit exit
+  * Block VM starts and conflicting GPU APIs while saved VF functions are absent
+  * Pause wake-up telemetry and hidden ATS/SR-IOV probes while the GPU sleeps
+  * Fail closed with a precise PCI-enumeration error during ATS policy removal
+
+ -- PVE GPU Manager <pve-gpu@localhost>  Sun, 30 Aug 2026 12:05:04 +0800
+
+pve-gpu-manager (1.1.0-9) stable; urgency=medium
+
+  * Insert GPU after Summary before ExtJS binds the navigation TreeStore
+  * Preserve device and VF grid column sizing in browser-local PVE state
+  * Version the plugin script URL so upgrades cannot reuse stale JavaScript
+
+ -- PVE GPU Manager <pve-gpu@localhost>  Sun, 30 Aug 2026 03:06:27 +0800
+
+pve-gpu-manager (1.1.0-8) stable; urgency=medium
+
+  * Place the GPU node entry directly after Summary in the root navigation
+  * Preserve device and VF grid column sizing in browser-local PVE state
+
+ -- PVE GPU Manager <pve-gpu@localhost>  Sun, 30 Aug 2026 02:42:12 +0800
+
+pve-gpu-manager (1.1.0-7) stable; urgency=medium
+
+  * Compact the GPU device list to the reviewed two-row layout
+  * Move device properties and ATS policy into on-demand dialogs
+  * Keep ATS fail-closed safety loading without occupying visible workspace
+  * Label GPU-local memory as LMEM/VRAM and reserve space for the VF list
+
+ -- PVE GPU Manager <pve-gpu@localhost>  Sun, 30 Aug 2026 01:56:56 +0800
+
+pve-gpu-manager (1.1.0-6) stable; urgency=medium
+
+  * Accept the comma-delimited ATSCtl state emitted by real pciutils lspci
+
+ -- PVE GPU Manager <pve-gpu@localhost>  Sat, 29 Aug 2026 23:36:00 +0800
+
+pve-gpu-manager (1.1.0-5) stable; urgency=medium
+
+  * Add one-click transactional switching from SR-IOV VFs to whole-GPU passthrough
+  * Detach stopped VF consumers, remove VF profiles, and assign the PF to one VM
+  * Preserve unrelated PCI devices and VFIO policy with full failure rollback
+  * Treat an already-correct running whole-GPU assignment as an idempotent no-op
+  * Gate B50 PF passthrough on AMD until pci=noats is active and persistent
+    and lspci reports ATSCtl Enable-
+  * Add owned GRUB/proxmox-boot-tool policy management without automatic reboot
+  * Guard native qm/API/HA starts and replay the guards after qemu-server updates
+  * Block boot guest start when persisted GPU binders or native guards fail
+
+ -- PVE GPU Manager <pve-gpu@localhost>  Sat, 29 Aug 2026 18:00:00 +0800
+
 pve-gpu-manager (1.1.0-4) stable; urgency=medium
 
   * Keep multi-GPU UI requests scoped to the selected PCI device

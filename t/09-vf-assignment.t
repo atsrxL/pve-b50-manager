@@ -19,15 +19,19 @@ $ENV{PATH} = '/usr/sbin:/usr/bin:/sbin:/bin';
 my $root = tempdir(CLEANUP => 1);
 my $qemu_dir = "$root/etc/pve/qemu-server";
 my $sriov_config = "$root/etc/pve/local/gpu-sriov.conf";
+my $vfio_config = "$root/etc/pve-gpu-vfio.conf";
+my $power_state = "$root/run/pve-gpu/power-state.conf";
 my $sriov_lock = "$root/sriov.lock";
 my $pci_lock = "$root/pci-id-reservations.lock";
 make_path(dirname($sriov_config), $qemu_dir);
 
 $ENV{PVE_GPU_SYSFS_ROOT} = $root;
 $ENV{PVE_GPU_SRIOV_CONF} = $sriov_config;
+$ENV{PVE_GPU_VFIO_CONF} = $vfio_config;
 $ENV{PVE_GPU_QEMU_CONF_DIR} = $qemu_dir;
 $ENV{PVE_GPU_SRIOV_LOCK} = $sriov_lock;
 $ENV{PVE_GPU_PCI_RESERVATION_LOCK} = $pci_lock;
+$ENV{PVE_GPU_POWER_STATE} = $power_state;
 
 my ($safe_lib) = "$FindBin::Bin/../src" =~ m{\A([A-Za-z0-9_./:+\-]+)\z};
 die "Unsafe test library path\n" if !defined($safe_lib);
@@ -112,7 +116,15 @@ for my $pair (
 make_path("$root/sys/module/xe", "$root/sys/class/drm/card0");
 replace_symlink("$root/sys/module/xe", "$pf_path/driver");
 replace_symlink($pf_path, "$root/sys/class/drm/card0/device");
-write_file("$root/proc/cpuinfo", "flags: vmx\n");
+write_file("$root/proc/cpuinfo", "vendor_id : GenuineIntel\nflags: vmx\n");
+write_file("$pf_path/sriov_admin/pf/profile/sched_priority", '0');
+write_file("$pf_path/sriov_admin/.bulk_profile/sched_priority", '0');
+write_file("$root/sys/kernel/debug/dri/$pf/sriov/restore_auto_provisioning", '0');
+write_file("$pf_path/power/control", 'auto');
+write_file("$pf_path/power/autosuspend_delay_ms", '1000');
+write_file("$pf_path/power/runtime_status", 'suspended');
+write_file("$pf_path/power/runtime_usage", '0');
+write_file("$pf_path/power_state", 'D3cold');
 write_valid_sriov_config();
 
 for my $index (1 .. 2) {
@@ -129,6 +141,7 @@ for my $index (1 .. 2) {
     }
     replace_symlink($pf_path, "$vf_path/physfn");
     replace_symlink($vf_path, "$pf_path/virtfn" . ($index - 1));
+    write_file("$pf_path/sriov_admin/vf$index/profile/sched_priority", '0');
 
     my $tile = "$root/sys/kernel/debug/dri/$pf/sriov/vf$index/tile0";
     write_file("$tile/vram_quota", 1024 ** 3);
@@ -146,6 +159,7 @@ my %vm_config;
 my %running;
 my %fail_write;
 my %mock_driver = map { $_ => '' } @vf_bdfs;
+my $mock_pf_driver = 'xe';
 my @driver_autoprobe_seen;
 my @lock_events;
 my @lock_args;
@@ -178,12 +192,22 @@ sub set_vm {
 
 sub reset_vms {
     unlink($_) for bsd_glob("$qemu_dir/*.conf");
+    unlink($vfio_config) if -e $vfio_config;
+    unlink($power_state) if -e $power_state;
     %vm_config = ();
     %running = ();
     %fail_write = ();
     %mock_driver = map { $_ => '' } @vf_bdfs;
+    $mock_pf_driver = 'xe';
     write_file("$root/sys/bus/pci/devices/$_/driver_override", '(null)') for @vf_bdfs;
+    write_file("$pf_path/driver_override", '(null)');
+    write_file("$pf_path/sriov_numvfs", '2');
     write_file("$pf_path/sriov_drivers_autoprobe", '0');
+    write_file("$pf_path/power/control", 'auto');
+    write_file("$pf_path/power/autosuspend_delay_ms", '1000');
+    write_file("$pf_path/power/runtime_status", 'suspended');
+    write_file("$pf_path/power/runtime_usage", '0');
+    write_file("$pf_path/power_state", 'D3cold');
     @driver_autoprobe_seen = ();
     @lock_events = ();
     @lock_args = ();
@@ -200,6 +224,23 @@ sub assign_vf {
         my $ok = eval {
             $result = PVE::API2::Hardware::GPU::_set_vf_assignment(
                 $bdf, $vf_index, $vmid,
+            );
+            1;
+        };
+        $error = $@ if !$ok;
+    }
+    return ($result, $error // '');
+}
+
+sub switch_pf {
+    my ($bdf, $vmid) = @_;
+    my ($result, $error);
+    {
+        local $@;
+        my $ok = eval {
+            $result = PVE::API2::Hardware::GPU::_switch_to_pf_passthrough(
+                $bdf,
+                $vmid,
             );
             1;
         };
@@ -275,7 +316,7 @@ sub assign_vf {
 
     *PVE::API2::Hardware::GPU::_pci_driver = sub {
         my ($bdf) = @_;
-        return 'xe' if $bdf eq $pf;
+        return $mock_pf_driver if $bdf eq $pf;
         return $mock_driver{$bdf} // '';
     };
 
@@ -284,18 +325,40 @@ sub assign_vf {
         my $autoprobe = read_file("$pf_path/sriov_drivers_autoprobe");
         $autoprobe =~ s/\s+\z//;
         push @driver_autoprobe_seen, $autoprobe;
-        $mock_driver{$bdf} = $driver // '';
+        if ($bdf eq $pf) {
+            $mock_pf_driver = $driver // '';
+        } else {
+            $mock_driver{$bdf} = $driver // '';
+        }
         write_file("$root/sys/bus/pci/devices/$bdf/driver_override", '(null)');
         return 1;
     };
 
     *PVE::API2::Hardware::GPU::_restore_vf_driver_state = sub {
         my ($bdf, $driver, $override) = @_;
-        $mock_driver{$bdf} = $driver // '';
+        if ($bdf eq $pf) {
+            $mock_pf_driver = $driver // '';
+        } else {
+            $mock_driver{$bdf} = $driver // '';
+        }
         write_file(
             "$root/sys/bus/pci/devices/$bdf/driver_override",
             defined($override) ? $override : '(null)',
         );
+        return 1;
+    };
+
+    *PVE::API2::Hardware::GPU::_bind_vf_driver = sub {
+        my ($bdf, $driver) = @_;
+        $mock_driver{$bdf} = $driver // '';
+        write_file("$root/sys/bus/pci/devices/$bdf/driver_override", '(null)');
+        return 1;
+    };
+
+    *PVE::API2::Hardware::GPU::_unbind_vf = sub {
+        my ($bdf) = @_;
+        $mock_driver{$bdf} = '';
+        write_file("$root/sys/bus/pci/devices/$bdf/driver_override", '(null)');
         return 1;
     };
 
@@ -649,6 +712,707 @@ subtest 'assignment requires a boot-restorable PF/VF profile' => sub {
     is($after_clear->{"$pf/vf1"}{driver}, 'vfio-pci',
         'recovery unassignment skips persistence mutation for an invalid profile');
 };
+
+subtest 'whole-PF convenience transaction rejects unsafe VM state and mappings' => sub {
+    reset_vms();
+    write_valid_sriov_config();
+    set_vm(1001, { hostpci0 => "$vf_bdfs[0],rombar=0" });
+    set_vm(1002, { machine => 'q35' });
+    $running{1001} = 1;
+    my ($got, $why) = switch_pf($pf, 1002);
+    ok(!$got, 'a running VF consumer blocks the whole-PF transaction');
+    like($why, qr/Stop VM 1001/, 'the running consumer is identified');
+    is(read_file("$pf_path/sriov_numvfs"), '2',
+        'unsafe VM state is rejected before the VF topology changes');
+    is($mock_pf_driver, 'xe',
+        'unsafe VM state is rejected before the PF driver changes');
+
+    reset_vms();
+    write_valid_sriov_config();
+    set_vm(1003, { hostpci0 => "mapping=b50-vf" });
+    set_vm(1004, {});
+    {
+        no warnings 'redefine';
+        local *PVE::API2::Hardware::GPU::_resolve_hostpci_bdfs = sub {
+            my ($value, $strict) = @_;
+            return ($vf_bdfs[0]) if $value =~ /mapping=b50-vf/;
+            return PVE::API2::Hardware::GPU::_normalise_bdf(
+                ($value =~ /^([^,]+)/)[0],
+            );
+        };
+        ($got, $why) = switch_pf($pf, 1004);
+    }
+    ok(!$got, 'a mapping-backed VF assignment is not deleted automatically');
+    like($why, qr/PCI mapping/, 'mapping rejection gives an actionable reason');
+    is(read_file("$pf_path/sriov_numvfs"), '2',
+        'mapping rejection leaves the VF topology unchanged');
+};
+
+subtest 'whole-PF transaction rolls back VM, topology, drivers, and policies' => sub {
+    reset_vms();
+    write_valid_sriov_config();
+    write_file($vfio_config, "0000:0a:00.0\n");
+    set_vm(1101, {
+        hostpci0 => '0000:70:00.0',
+        hostpci3 => "$vf_bdfs[0],rombar=0",
+    });
+    set_vm(1102, {
+        machine => 'q35',
+        hostpci2 => '0000:71:00.0',
+    });
+    $mock_driver{$vf_bdfs[0]} = 'vfio-pci';
+    $mock_driver{$vf_bdfs[1]} = 'xe';
+    write_file("$root/sys/bus/pci/devices/$vf_bdfs[0]/driver_override", 'xe');
+
+    my $source_before = read_file(_vm_conf_path(1101));
+    my $target_before = read_file(_vm_conf_path(1102));
+    my $sriov_before = read_file($sriov_config);
+    my $vfio_before = read_file($vfio_config);
+    $fail_write{1102} = 1;
+    my ($got, $why) = switch_pf($pf, 1102);
+
+    ok(!$got, 'an injected target VM write failure aborts whole-PF passthrough');
+    like($why, qr/injected write failure/, 'the transaction reports its original failure');
+    is(read_file(_vm_conf_path(1101)), $source_before,
+        'rollback restores the VF source VM configuration');
+    is(read_file(_vm_conf_path(1102)), $target_before,
+        'rollback restores the target VM configuration');
+    is(read_file("$pf_path/sriov_numvfs"), '2',
+        'rollback recreates the original VF topology');
+    is($mock_pf_driver, 'xe', 'rollback restores the PF xe driver');
+    is($mock_driver{$vf_bdfs[0]}, 'vfio-pci',
+        'rollback restores the first VF driver');
+    is($mock_driver{$vf_bdfs[1]}, 'xe',
+        'rollback restores the second VF driver');
+    is(read_file("$root/sys/bus/pci/devices/$vf_bdfs[0]/driver_override"), 'xe',
+        'rollback restores the exact VF driver_override value');
+    is(read_file($sriov_config), $sriov_before,
+        'rollback restores the complete SR-IOV persistence file');
+    is(read_file($vfio_config), $vfio_before,
+        'rollback restores the VFIO policy without losing unrelated BDFs');
+};
+
+subtest 'whole-PF transaction, running no-op, and stopped move' => sub {
+    reset_vms();
+    write_valid_sriov_config();
+    write_file($vfio_config, "0000:0a:00.0\n");
+    set_vm(1201, {
+        hostpci0 => '0000:72:00.0',
+        hostpci4 => "$vf_bdfs[0],rombar=0",
+    });
+    set_vm(1202, { hostpci1 => "host=$vf_bdfs[1],rombar=0" });
+    set_vm(1203, {
+        machine => 'q35',
+        hostpci2 => '0000:73:00.0',
+    });
+    $mock_driver{$vf_bdfs[0]} = 'vfio-pci';
+    $mock_driver{$vf_bdfs[1]} = 'vfio-pci';
+
+    my ($got, $why) = switch_pf($pf, 1203);
+    ok($got && !$why, 'stopped VF consumers are replaced by one whole-PF assignment')
+        or diag($why);
+    ok($got && ${$got->{changed}}, 'the first whole-PF switch reports changed=true');
+    is_deeply($got->{detached_vmids}, [1201, 1202],
+        'the response identifies every detached VF consumer VM');
+    ok(!exists($vm_config{1201}{hostpci4}),
+        'the first VF hostpci entry is removed');
+    is($vm_config{1201}{hostpci0}, '0000:72:00.0',
+        'unrelated source PCI devices remain configured');
+    ok(!exists($vm_config{1202}{hostpci1}),
+        'the second VF hostpci entry is removed');
+    is($vm_config{1203}{hostpci0}, "$pf,pcie=1",
+        'q35 receives the exact PF function with pcie=1 and no ROM-Bar or x-vga flags');
+    is($vm_config{1203}{hostpci2}, '0000:73:00.0',
+        'unrelated target PCI devices remain configured');
+    is(read_file("$pf_path/sriov_numvfs"), '0',
+        'all VFs are removed');
+    is($mock_pf_driver, 'vfio-pci', 'the PF is bound to vfio-pci');
+    my $sriov_after = PVE::API2::Hardware::GPU::parse_ini_config(
+        $sriov_config,
+        1,
+    );
+    ok(!exists($sriov_after->{$pf}) &&
+       !(grep { /^\Q$pf\E\/vf\d+$/ } keys %$sriov_after),
+        'the PF and all VF boot profiles are removed');
+    is(read_file($vfio_config), "0000:0a:00.0\n$pf\n",
+        'the PF boot policy is added while an unrelated VFIO BDF is preserved');
+
+    $vm_config{1203}{pending} = { delete => 'hostpci0' };
+    my $writes_before_pending = $write_calls;
+    ($got, $why) = switch_pf($pf, 1203);
+    ok(!$got, 'same-target verification rejects a pending PF removal');
+    like($why, qr/pending PCI/, 'the pending same-target change is identified');
+    is($write_calls, $writes_before_pending,
+        'pending same-target rejection does not rewrite a VM config');
+    delete $vm_config{1203}{pending};
+
+    my $writes_before_noop = $write_calls;
+    $running{1203} = 1;
+    ($got, $why) = switch_pf($pf, 1203);
+    ok($got && !$why, 'the already-correct running target is accepted as a pure no-op')
+        or diag($why);
+    ok($got && !${$got->{changed}}, 'the running same-target call reports changed=false');
+    is($write_calls, $writes_before_noop,
+        'the running same-target no-op does not rewrite a VM config');
+
+    $running{1203} = 0;
+    set_vm(1204, { machine => 'q35' });
+    ($got, $why) = switch_pf($pf, 1204);
+    ok($got && !$why, 'an existing stopped PF assignment moves to another stopped VM')
+        or diag($why);
+    ok(!exists($vm_config{1203}{hostpci0}),
+        'the old whole-PF assignment is removed');
+    is($vm_config{1204}{hostpci0}, "$pf,pcie=1",
+        'the new target receives the canonical whole-PF hostpci value');
+    is($mock_pf_driver, 'vfio-pci',
+        'moving an existing PF assignment does not disturb the live VFIO driver');
+    is(read_file($vfio_config), "0000:0a:00.0\n$pf\n",
+        'moving the PF preserves the existing boot policy');
+};
+
+subtest 'whole-PF transaction rejects a consumer outside the VM lock set' => sub {
+    reset_vms();
+    write_valid_sriov_config();
+    set_vm(1301, { machine => 'q35' });
+
+    my $real_scan = \&PVE::API2::Hardware::GPU::_scan_qemu_pci_consumers;
+    my $injected = 0;
+    my ($got, $why);
+    {
+        no warnings 'redefine';
+        local *PVE::API2::Hardware::GPU::_all_qemu_vmids = sub { return (1301) };
+        local *PVE::API2::Hardware::GPU::_scan_qemu_pci_consumers = sub {
+            if (!$injected++) {
+                set_vm(1302, { hostpci0 => "$vf_bdfs[0],rombar=0" });
+            }
+            return $real_scan->(@_);
+        };
+        ($got, $why) = switch_pf($pf, 1301);
+    }
+
+    ok(!$got, 'a late VF consumer outside the VM lock set is rejected');
+    like($why, qr/after the VM lock set was acquired/,
+        'late-consumer rejection identifies the lock-set race');
+    ok(!(grep { $_ eq 'vm:1302' } @lock_events),
+        'the fixture proves the late consumer was never locked');
+    is(read_file("$pf_path/sriov_numvfs"), '2',
+        'late-consumer rejection occurs before VF topology mutation');
+    is($mock_pf_driver, 'xe',
+        'late-consumer rejection occurs before PF driver mutation');
+};
+
+subtest 'AMD B50 ATS policy gates PF writes and exposes helper actions' => sub {
+    my $old_cpuinfo = read_file("$root/proc/cpuinfo");
+    my $old_cmdline = -e "$root/proc/cmdline"
+        ? read_file("$root/proc/cmdline")
+        : undef;
+    my $helper = "$root/manage-ats-policy.sh";
+    my $helper_persistent = 0;
+    my $helper_managed = 1;
+    my $helper_boot_mode = 'grub';
+    my $helper_failure = 0;
+    my $lspci_failure = 0;
+    my $lspci_output = "ATSCtl: Enable+\n";
+    my @ats_commands;
+
+    {
+        no warnings 'redefine';
+        local $ENV{PVE_GPU_ATS_POLICY_HELPER} = $helper;
+        local *PVE::API2::Hardware::GPU::_get_device_name = sub {
+            return 'B50 test fixture';
+        };
+        local *PVE::API2::Hardware::GPU::_ats_command_capture = sub {
+            my ($command) = @_;
+            push @ats_commands, [@$command];
+            if ($command->[0] eq 'lspci') {
+                return {
+                    success => 0,
+                    exit_code => 1,
+                    stdout => $lspci_output,
+                    stderr => '',
+                    error => 'injected lspci failure',
+                } if $lspci_failure;
+                return {
+                    success => 1,
+                    exit_code => 0,
+                    stdout => $lspci_output,
+                    stderr => '',
+                    error => undef,
+                };
+            }
+            if ($command->[0] eq $helper && $command->[1] eq 'status') {
+                return {
+                    success => 0,
+                    exit_code => 1,
+                    stdout => '',
+                    stderr => '',
+                    error => 'injected helper status failure',
+                } if $helper_failure;
+                return {
+                    success => 1,
+                    exit_code => 0,
+                    stdout => "boot_mode=$helper_boot_mode\n" .
+                        "persistent_noats=$helper_persistent\n" .
+                        "managed=$helper_managed\n",
+                    stderr => '',
+                    error => undef,
+                };
+            }
+            if ($command->[0] eq $helper && $command->[1] eq 'enable') {
+                return {
+                    success => 0,
+                    exit_code => 1,
+                    stdout => '',
+                    stderr => '',
+                    error => 'injected helper enable failure',
+                } if $helper_failure;
+                $helper_persistent = 1;
+                return { success => 1, exit_code => 0, stdout => '', stderr => '', error => undef };
+            }
+            if ($command->[0] eq $helper && $command->[1] eq 'disable') {
+                return {
+                    success => 0,
+                    exit_code => 1,
+                    stdout => '',
+                    stderr => '',
+                    error => 'injected helper disable failure',
+                } if $helper_failure;
+                $helper_persistent = 0;
+                return { success => 1, exit_code => 0, stdout => '', stderr => '', error => undef };
+            }
+            die "unexpected ATS command: " . join(' ', @$command) . "\n";
+        };
+
+        write_file("$root/proc/cpuinfo", "vendor_id : AuthenticAMD\nflags: svm\n");
+        write_file("$root/proc/cmdline", "root=/dev/fake\n");
+        $helper_failure = 0;
+        $helper_persistent = 0;
+        $lspci_output = "ATSCtl: Enable+\n";
+        my $status = PVE::API2::Hardware::GPU::_ats_policy_status($pf);
+        ok(${$status->{affected}}, 'B50 PF on AuthenticAMD is affected');
+        ok(!$status->{safe} || !${$status->{safe}},
+            'unconfigured no-ATS policy is unsafe');
+        like($status->{reason}, qr/pci=noats.*reboot.*retry/i,
+            'unsafe status explains enabling pci=noats and rebooting');
+
+        reset_vms();
+        write_valid_sriov_config();
+        set_vm(1401, { machine => 'q35' });
+        my $writes_before = $write_calls;
+        my ($got, $why) = switch_pf($pf, 1401);
+        ok(!$got, 'unconfigured AMD ATS policy blocks whole-PF passthrough');
+        like($why, qr/pci=noats.*reboot.*retry/i,
+            'whole-PF rejection is actionable');
+        is($write_calls, $writes_before,
+            'whole-PF rejection makes no VM configuration write');
+        is(read_file("$pf_path/sriov_numvfs"), '2',
+            'whole-PF rejection makes no VF topology write');
+        is($mock_pf_driver, 'xe',
+            'whole-PF rejection makes no PF driver write');
+
+        # A persistent policy which is not in the running kernel still needs
+        # a reboot before any dangerous PF operation is allowed.
+        $helper_persistent = 1;
+        $lspci_output = "ATSCtl: Enable-\n";
+        $status = PVE::API2::Hardware::GPU::_ats_policy_status($pf);
+        ok(!$status->{safe} || !${$status->{safe}},
+            'persistent but inactive no-ATS policy remains unsafe');
+        ok(${$status->{reboot_required}},
+            'persistent but inactive policy explicitly requires reboot');
+        like($status->{reason}, qr/reboot/i,
+            'persistent but inactive status explains reboot requirement');
+
+        # The current boot may have pci=noats while the future boot is not
+        # protected.  This is also unsafe until the helper persists it.
+        write_file("$root/proc/cmdline", "root=/dev/fake pci=noats\n");
+        $helper_persistent = 0;
+        $status = PVE::API2::Hardware::GPU::_ats_policy_status($pf);
+        ok(!$status->{safe} || !${$status->{safe}},
+            'active-only no-ATS policy remains unsafe');
+        ok(${$status->{reboot_required}},
+            'active-only policy reports that current and future boot state differ');
+        like($status->{reason}, qr/persistent/i,
+            'active-only status explains persistence requirement');
+
+        # All three independent conditions are required for the gate.
+        $helper_persistent = 1;
+        $status = PVE::API2::Hardware::GPU::_ats_policy_status($pf);
+        ok(${$status->{safe}},
+            'active, persistent, explicitly disabled ATS is safe');
+        my $safe_state = PVE::API2::Hardware::GPU::_assert_ats_safe_for_pf($pf);
+        ok($safe_state->{safe}, 'safe policy allows the PF guard to return');
+
+        # Output alone is not enough: an lspci command which exits non-zero
+        # must remain unsafe even if its partial output says Enable-.
+        $lspci_failure = 1;
+        $lspci_output = "ATSCtl: Enable-\n";
+        $status = PVE::API2::Hardware::GPU::_ats_policy_status($pf);
+        ok(!$status->{safe} || !${$status->{safe}},
+            'lspci failure keeps an otherwise complete policy unsafe');
+        like($status->{reason}, qr/lspci failed/i,
+            'lspci failure is included in the ATS safety reason');
+        eval { PVE::API2::Hardware::GPU::_assert_ats_safe_for_pf($pf) };
+        like($@, qr/lspci failed.*pci=noats.*reboot.*retry/i,
+            'lspci failure blocks the PF guard with an actionable remedy');
+        $lspci_failure = 0;
+
+        # Intel hosts are outside this workaround and remain safe even when
+        # the optional helper is unavailable.
+        write_file("$root/proc/cpuinfo", "vendor_id : GenuineIntel\nflags: vmx\n");
+        $helper_failure = 1;
+        @ats_commands = ();
+        $status = PVE::API2::Hardware::GPU::_ats_policy_status($pf);
+        ok(!$status->{affected} || !${$status->{affected}},
+            'B50 PF on a known non-AMD CPU is not affected');
+        ok(${$status->{safe}}, 'non-AMD status is safe');
+        ok((grep { $_->[0] eq 'lspci' } @ats_commands),
+            'non-AMD status still reports lspci ATS state');
+        ok((grep { $_->[0] eq $helper && $_->[1] eq 'status' } @ats_commands),
+            'non-AMD status still parses helper state without gating the device');
+
+        # Only AuthenticAMD and GenuineIntel are known CPU identities.  A
+        # malformed/unknown vendor must not be treated as a harmless host.
+        write_file("$root/proc/cpuinfo", "vendor_id : UnknownVendor\nflags: svm\n");
+        write_file("$root/proc/cmdline", "root=/dev/fake pci=noats\n");
+        $helper_failure = 0;
+        $helper_persistent = 1;
+        $lspci_output = "ATSCtl: Enable-\n";
+        $status = PVE::API2::Hardware::GPU::_ats_policy_status($pf);
+        ok(${$status->{affected}}, 'unknown CPU vendor keeps B50 in the affected set');
+        ok(!$status->{safe} || !${$status->{safe}},
+            'unknown CPU vendor keeps the ATS gate unsafe');
+        like($status->{reason}, qr/CPU vendor/i,
+            'unknown CPU vendor is reported as an identity error');
+        eval { PVE::API2::Hardware::GPU::_assert_ats_safe_for_pf($pf) };
+        like($@, qr/CPU vendor.*pci=noats.*reboot.*retry/i,
+            'unknown CPU vendor blocks PF operations with an actionable remedy');
+
+        # Restore the affected identity for the driver-path checks.
+        write_file("$root/proc/cpuinfo", "vendor_id : AuthenticAMD\nflags: svm\n");
+        write_file("$root/proc/cmdline", "root=/dev/fake\n");
+        $helper_failure = 0;
+        $helper_persistent = 0;
+        $lspci_output = "ATSCtl: Enable+\n";
+        reset_vms();
+        write_valid_sriov_config();
+        my $driver_before = $mock_pf_driver;
+        my $vf_count_before = read_file("$pf_path/sriov_numvfs");
+        eval { PVE::API2::Hardware::GPU::_set_pf_driver($pf, 'vfio-pci') };
+        $why = $@;
+        ok($why, 'unsafe ATS policy blocks PF vfio bind');
+        like($why, qr/pci=noats.*reboot.*retry/i,
+            'PF vfio bind rejection explains the required policy');
+        is($mock_pf_driver, $driver_before,
+            'blocked PF vfio bind does not change the driver');
+        is(read_file("$pf_path/sriov_numvfs"), $vf_count_before,
+            'blocked PF vfio bind does not change VF topology');
+
+        # Unbinding to xe is intentionally retained as the recovery path.
+        write_file("$pf_path/sriov_numvfs", '0');
+        $mock_pf_driver = 'vfio-pci';
+        write_file($vfio_config, "$pf\n");
+        my $unbound = eval {
+            PVE::API2::Hardware::GPU::_set_pf_driver($pf, 'xe');
+            1;
+        };
+        $why = $@;
+        ok($unbound && !$why, 'unsafe ATS policy still allows PF unbind to xe')
+            or diag($why);
+        is($mock_pf_driver, 'xe', 'PF recovery binds xe');
+
+        # Helper status parsing and the two mutating API operations use only
+        # the helper; neither operation performs a reboot.
+        write_file("$root/proc/cmdline", "root=/dev/fake pci=noats\n");
+        $helper_persistent = 0;
+        $lspci_output = "ATSCtl: Enable-\n";
+        @ats_commands = ();
+        $status = PVE::API2::Hardware::GPU::_ats_policy_status($pf);
+        is($status->{cpu_vendor}, 'AuthenticAMD', 'status reports CPU vendor');
+        is($status->{boot_mode}, 'grub', 'status parses helper boot_mode');
+        ok(!$status->{persistent_noats} || !${$status->{persistent_noats}},
+            'status parses helper persistent_noats=0');
+        ok(${$status->{managed}}, 'status parses helper managed=1');
+
+        $helper_boot_mode = 'bogus';
+        $helper_persistent = 'true';
+        $helper_managed = 'yes';
+        my $malformed_state = PVE::API2::Hardware::GPU::_ats_policy_state($pf);
+        ok(!$malformed_state->{safe},
+            'non-canonical helper status keeps the internal ATS gate unsafe');
+        ok(!$malformed_state->{helper_ok},
+            'non-canonical helper values make internal helper status invalid');
+        like($malformed_state->{helper_error},
+            qr/canonical persistent_noats.*canonical managed.*invalid boot_mode/i,
+            'internal helper status reports every invalid canonical field');
+        $status = PVE::API2::Hardware::GPU::_ats_policy_status($pf);
+        ok(!$status->{safe} || !${$status->{safe}},
+            'public API reports non-canonical helper status as unsafe');
+        like($status->{reason},
+            qr/canonical persistent_noats.*canonical managed.*invalid boot_mode/i,
+            'public API reason exposes the malformed helper status');
+        $helper_boot_mode = 'grub';
+        $helper_persistent = 0;
+        $helper_managed = 1;
+
+        my $enabled = PVE::API2::Hardware::GPU::_enable_ats_policy($pf);
+        ok($enabled && ${$enabled->{persistent_noats}},
+            'POST-equivalent helper enable persists the policy');
+        ok((grep { $_->[0] eq $helper && $_->[1] eq 'enable' } @ats_commands),
+            'POST-equivalent action invokes helper enable');
+
+        reset_vms();
+        @ats_commands = ();
+        my $disabled = PVE::API2::Hardware::GPU::_disable_ats_policy($pf);
+        ok($disabled && !${$disabled->{persistent_noats}},
+            'DELETE-equivalent helper disable removes the policy');
+        ok(${$disabled->{reboot_required}},
+            'DELETE reports that a reboot is required to restore ATS');
+        ok((grep { $_->[0] eq $helper && $_->[1] eq 'disable' } @ats_commands),
+            'DELETE-equivalent action invokes helper disable');
+
+        # DELETE refuses to remove a policy while the PF is still assigned.
+        $helper_persistent = 1;
+        set_vm(1402, { hostpci0 => $pf });
+        @ats_commands = ();
+        eval { PVE::API2::Hardware::GPU::_disable_ats_policy($pf) };
+        $why = $@;
+        like($why, qr/PF.*consumed.*VM 1402/i,
+            'DELETE rejects an active PF VM consumer');
+        ok(!(grep { $_->[0] eq $helper && $_->[1] eq 'disable' } @ats_commands),
+            'PF-consumer rejection does not call helper disable');
+
+        reset_vms();
+        write_file($vfio_config, "$pf\n");
+        @ats_commands = ();
+        eval { PVE::API2::Hardware::GPU::_disable_ats_policy($pf) };
+        $why = $@;
+        like($why, qr/VFIO.*persistent/i,
+            'DELETE rejects an active PF VFIO persistence entry');
+        ok(!(grep { $_->[0] eq $helper && $_->[1] eq 'disable' } @ats_commands),
+            'VFIO-policy rejection does not call helper disable');
+
+        # Removing pci=noats is host-wide.  A second PF whose identity cannot
+        # be read might itself be another B50, so it must make DELETE fail
+        # closed before invoking the helper.
+        write_file($vfio_config, '');
+        my $unknown_pf_bdf = '0000:0d:00.0';
+        my $unknown_pf_path = "$root/sys/bus/pci/devices/$unknown_pf_bdf";
+        make_path($unknown_pf_path);
+        write_file("$unknown_pf_path/device", '0xe212');
+        @ats_commands = ();
+        eval { PVE::API2::Hardware::GPU::_disable_ats_policy($pf) };
+        $why = $@;
+        like($why, qr/host-wide no-ATS policy.*identity is unknown.*0d:00\.0/i,
+            'DELETE fails closed when another PCI PF identity is unreadable');
+        ok(!(grep { $_->[0] eq $helper && $_->[1] eq 'disable' } @ats_commands),
+            'unknown second PF rejection does not call helper disable');
+        write_file("$unknown_pf_path/vendor", '0x10de');
+        write_file("$unknown_pf_path/device", '0x1b80');
+
+        # The initial target probe can race with a disappearing or unreadable
+        # sysfs PCI directory.  Host-wide policy removal must still fail closed
+        # rather than assuming that no second affected PF exists.
+        {
+            no warnings 'redefine';
+            my $devices_dir = "$root/sys/bus/pci/devices";
+            my $hidden_devices_dir = "$root/sys/bus/pci/devices.hidden";
+            local *PVE::API2::Hardware::GPU::_with_gpu_lock = sub {
+                my ($code) = @_;
+                rename($devices_dir, $hidden_devices_dir)
+                    or die "Cannot hide PCI fixture directory: $!";
+                my $result = eval { $code->() };
+                my $error = $@;
+                rename($hidden_devices_dir, $devices_dir)
+                    or die "Cannot restore PCI fixture directory: $!";
+                die $error if $error;
+                return $result;
+            };
+            @ats_commands = ();
+            eval { PVE::API2::Hardware::GPU::_disable_ats_policy($pf) };
+            $why = $@;
+            like($why, qr/host-wide no-ATS policy.*PCI devices cannot be enumerated/i,
+                'DELETE fails closed when the PCI device directory disappears');
+            ok(!(grep { $_->[0] eq $helper && $_->[1] eq 'disable' } @ats_commands),
+                'PCI enumeration failure does not call helper disable');
+        }
+
+        # A helper failure is surfaced and does not touch the GPU/VM state.
+        reset_vms();
+        $helper_failure = 1;
+        @ats_commands = ();
+        my $writes_before_failure = $write_calls;
+        eval { PVE::API2::Hardware::GPU::_enable_ats_policy($pf) };
+        $why = $@;
+        like($why, qr/helper.*failed/i,
+            'helper enable failure is reported');
+        is($write_calls, $writes_before_failure,
+            'helper failure makes no VM configuration write');
+        is(read_file("$pf_path/sriov_numvfs"), '2',
+            'helper failure makes no VF topology write');
+        is($mock_pf_driver, 'xe',
+            'helper failure makes no PF driver write');
+
+        # A host-wide policy must never be changed through an unrelated GPU
+        # endpoint, even when that device is otherwise safe for passthrough.
+        my $other_bdf = '0000:0c:00.0';
+        my $other_path = "$root/sys/bus/pci/devices/$other_bdf";
+        write_file("$other_path/vendor", '0x10de');
+        write_file("$other_path/device", '0x1b80');
+        @ats_commands = ();
+        eval { PVE::API2::Hardware::GPU::_enable_ats_policy($other_bdf) };
+        $why = $@;
+        like($why, qr/only available.*B50.*AuthenticAMD/i,
+            'POST-equivalent enable rejects an unrelated GPU');
+        eval { PVE::API2::Hardware::GPU::_disable_ats_policy($other_bdf) };
+        $why = $@;
+        like($why, qr/only available.*B50.*AuthenticAMD/i,
+            'DELETE-equivalent disable rejects an unrelated GPU');
+        ok(!(grep { $_->[0] eq $helper && $_->[1] =~ /^(?:enable|disable)$/ } @ats_commands),
+            'unrelated ATS policy requests do not invoke the helper');
+    }
+
+    write_file("$root/proc/cpuinfo", $old_cpuinfo);
+    if (defined($old_cmdline)) {
+        write_file("$root/proc/cmdline", $old_cmdline);
+    } else {
+        unlink("$root/proc/cmdline");
+    }
+};
+
+# Runtime-only B50 deep idle keeps VM hostpci and the persistent VF profile,
+# while refusing entry until every consumer has stopped.
+reset_vms();
+write_valid_sriov_config();
+set_vm(1202, { machine => 'q35' });
+($result, $error) = assign_vf($pf, 1, 1202);
+ok(!$error, 'deep-idle fixture assigns VF1 through the guarded path') or diag($error);
+$running{1202} = 1;
+{
+    local $@;
+    eval { PVE::API2::Hardware::GPU::_enter_deep_idle($pf) };
+    $error = $@;
+}
+like($error, qr/Cannot enter B50 deep idle.*Stop every VM/i,
+    'deep idle rejects a running VF consumer');
+is(read_file("$pf_path/sriov_numvfs"), '2',
+    'running-consumer rejection leaves the VF topology intact');
+ok(!-e $power_state,
+    'running-consumer rejection does not publish runtime power state');
+
+$running{1202} = 0;
+my $vm_before_power = read_file(_vm_conf_path(1202));
+my $profile_before_power = read_file($sriov_config);
+{
+    local $@;
+    $result = eval { PVE::API2::Hardware::GPU::_enter_deep_idle($pf) };
+    $error = $@;
+}
+ok(!$error, 'stopped persistent VF consumer can enter runtime deep idle') or diag($error);
+is($result->{mode}, 'deep-idle', 'entry response reports deep-idle mode');
+ok(${$result->{effective}}, 'entry response verifies the parked topology and 10ms policy');
+is(read_file("$pf_path/sriov_numvfs"), '0',
+    'deep idle temporarily removes every live VF');
+is(read_file("$pf_path/power/autosuspend_delay_ms"), '10',
+    'deep idle applies the tested 10ms autosuspend delay');
+is(read_file(_vm_conf_path(1202)), $vm_before_power,
+    'deep idle preserves the VM hostpci configuration byte-for-byte');
+is(read_file($sriov_config), $profile_before_power,
+    'deep idle preserves the persistent VF profile byte-for-byte');
+ok(-f $power_state, 'deep idle publishes a runtime-only recovery record');
+
+{
+    local $@;
+    my $start_ok = eval {
+        PVE::GPU::Power::assert_vm_start_allowed($vm_config{1202}, 1202);
+        1;
+    };
+    $error = $@;
+    ok(!$start_ok, 'native start guard blocks a VM whose VF is parked');
+}
+like($error, qr/Exit Power Saving/i,
+    'parked-VF start rejection directs the operator to the power dialog');
+
+{
+    local $@;
+    eval {
+        PVE::API2::Hardware::GPU::_configure_sriov_v2($pf, { num_vfs => 1 });
+    };
+    $error = $@;
+}
+like($error, qr/Cannot change SR-IOV state.*Exit Power Saving/i,
+    'direct SR-IOV API writes are blocked while the B50 is sleeping');
+is(read_file("$pf_path/sriov_numvfs"), '0',
+    'blocked direct SR-IOV write cannot recreate a VF');
+
+{
+    local $@;
+    eval { PVE::API2::Hardware::GPU::_ats_policy_status($pf) };
+    $error = $@;
+}
+like($error, qr/Cannot read ATS policy.*Exit Power Saving/i,
+    'ATS status cannot wake a B50 managed by power saving');
+
+$running{1202} = 1;
+{
+    local $@;
+    eval { PVE::API2::Hardware::GPU::_exit_deep_idle($pf) };
+    $error = $@;
+}
+like($error, qr/Cannot restore B50 VF topology.*running/i,
+    'deep-idle exit refuses to recreate VFs while a recorded consumer is running');
+is(read_file("$pf_path/sriov_numvfs"), '0',
+    'running-consumer exit rejection keeps the parked topology');
+ok(-f $power_state,
+    'running-consumer exit rejection keeps the recovery record');
+$running{1202} = 0;
+
+my $saved_power_record = PVE::GPU::Power::power_state_for_bdf($pf);
+my $invalid_power_record = dclone($saved_power_record);
+$invalid_power_record->{vf_bdfs} = $vf_bdfs[0];
+PVE::GPU::Power::set_power_state_for_bdf($pf, $invalid_power_record);
+{
+    local $@;
+    eval { PVE::API2::Hardware::GPU::_exit_deep_idle($pf) };
+    $error = $@;
+}
+like($error, qr/Saved VF BDF count mismatch/i,
+    'deep-idle exit rejects an incomplete recovery record before hardware writes');
+is(read_file("$pf_path/sriov_numvfs"), '0',
+    'invalid recovery state cannot create a partial VF topology');
+PVE::GPU::Power::set_power_state_for_bdf($pf, $saved_power_record);
+
+{
+    local $@;
+    $result = eval { PVE::API2::Hardware::GPU::_exit_deep_idle($pf) };
+    $error = $@;
+}
+ok(!$error, 'exiting deep idle restores the verified VF topology') or diag($error);
+is($result->{mode}, 'normal', 'exit response returns to normal mode');
+is(read_file("$pf_path/sriov_numvfs"), '2',
+    'exit restores the original VF count');
+is(read_file("$pf_path/power/autosuspend_delay_ms"), '1000',
+    'exit restores the original autosuspend delay');
+is($mock_driver{$vf_bdfs[0]}, 'vfio-pci',
+    'exit restores VF1 to its persisted vfio-pci driver');
+is(read_file(_vm_conf_path(1202)), $vm_before_power,
+    'exit still preserves the VM hostpci configuration');
+is(read_file($sriov_config), $profile_before_power,
+    'exit still preserves the persistent VF profile');
+ok(!-e $power_state, 'verified exit clears the runtime recovery record');
+
+reset_vms();
+write_file($sriov_config, '');
+{
+    local $@;
+    eval { PVE::API2::Hardware::GPU::_enter_deep_idle($pf) };
+    $error = $@;
+}
+like($error, qr/persistent SR-IOV profile/i,
+    'live VFs without a restorable profile cannot enter deep idle');
+is(read_file("$pf_path/sriov_numvfs"), '2',
+    'missing-profile rejection leaves the live topology unchanged');
+ok(!-e $power_state,
+    'missing-profile rejection leaves no stale runtime state');
 
 write_valid_sriov_config();
 

@@ -4,6 +4,7 @@ use strict;
 use warnings;
 use File::Glob ':bsd_glob';
 use PVE::Tools qw(run_command);
+use PVE::GPU::Power qw(is_deep_idle);
 use PVE::GPU::SRIOV qw(active_sched_priority);
 
 # ---------------------------------------------------------------------------
@@ -75,7 +76,28 @@ sub read_telemetry {
         fan_rpm            => undef,
         throttled          => undef,
         health             => 'OK',
+        sleeping           => \0,
     };
+
+    if (defined($bdf) && is_deep_idle($bdf)) {
+        my $base = "/sys/bus/pci/devices/$bdf";
+        $result->{sleeping} = \1;
+        $result->{health} = 'Sleeping';
+        $result->{power_mode} = 'deep-idle';
+        $result->{runtime_status} =
+            PVE::API2::Hardware::GPU::read_sysfs("$base/power/runtime_status");
+        my $usage = PVE::API2::Hardware::GPU::read_sysfs("$base/power/runtime_usage");
+        $result->{runtime_usage} = int($usage)
+            if defined($usage) && $usage =~ /^\d+$/;
+        my $delay = PVE::API2::Hardware::GPU::read_sysfs(
+            "$base/power/autosuspend_delay_ms"
+        );
+        $result->{autosuspend_delay_ms} = int($delay)
+            if defined($delay) && $delay =~ /^-?\d+$/;
+        $result->{pci_power_state} =
+            PVE::API2::Hardware::GPU::read_sysfs("$base/power_state");
+        return $result;
+    }
 
     # Temperature: read all hwmon temp sensors, match by label
     my $hwmon_base = PVE::API2::Hardware::GPU::sysfs_path("/sys/class/drm/$card/device/hwmon");
