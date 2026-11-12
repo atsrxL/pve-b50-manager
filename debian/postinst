@@ -21,6 +21,7 @@ enable_services() {
     systemctl daemon-reload
     systemctl enable pve-gpu-vfio.service
     systemctl enable pve-gpu-sriov.service
+    systemctl enable pve-gpu-power-limit.service
     if [ -e "$PVE_GUESTS_DROPIN" ]; then
         loaded_unit=$(systemctl cat pve-guests.service)
         printf '%s\n' "$loaded_unit" |

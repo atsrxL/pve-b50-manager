@@ -26,6 +26,8 @@ install:
 		$(DESTDIR)$(PREFIX)/lib/pve-gpu/apply-sriov-config.sh
 	install -D -m 0755 src/scripts/apply-vfio-config.sh \
 		$(DESTDIR)$(PREFIX)/lib/pve-gpu/apply-vfio-config.sh
+	install -D -m 0755 src/scripts/apply-power-limit.sh \
+		$(DESTDIR)$(PREFIX)/lib/pve-gpu/apply-power-limit.sh
 	install -D -m 0755 src/scripts/manage-ats-policy.sh \
 		$(DESTDIR)$(PREFIX)/lib/pve-gpu/manage-ats-policy.sh
 	install -D -m 0755 src/scripts/check-pve-gpu-binders.sh \
@@ -37,6 +39,8 @@ install:
 		$(DESTDIR)/lib/systemd/system/pve-gpu-sriov.service
 	install -D -m 0644 src/systemd/pve-gpu-vfio.service \
 		$(DESTDIR)/lib/systemd/system/pve-gpu-vfio.service
+	install -D -m 0644 src/systemd/pve-gpu-power-limit.service \
+		$(DESTDIR)/lib/systemd/system/pve-gpu-power-limit.service
 	install -D -m 0644 src/systemd/pve-guests.service.d/10-pve-gpu-manager.conf \
 		$(DESTDIR)/lib/systemd/system/pve-guests.service.d/10-pve-gpu-manager.conf
 	# APT hook

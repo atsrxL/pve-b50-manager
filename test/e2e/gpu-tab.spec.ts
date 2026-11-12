@@ -70,14 +70,32 @@ test.describe('GPU Tab', () => {
         }
     });
 
-    test('device grid carries telemetry and LMEM without a duplicate detail panel', async ({ page }) => {
+    test('device grid carries PF resident VRAM without a duplicate detail panel', async ({ page }) => {
         await openGpuTab(page);
 
         await page.locator('text=0000:04:00.0').first().click();
-        await expect(page.getByText('LMEM / VRAM', { exact: true })).toBeVisible({ timeout: 5000 });
+        await expect(page.getByText('PF VRAM', { exact: true })).toBeVisible({ timeout: 5000 });
+        await expect(page.getByText('PF 1.0/24.5 GiB', { exact: true })).toBeVisible({ timeout: 5000 });
         await expect(page.getByText('43°C', { exact: true })).toBeVisible({ timeout: 5000 });
         await expect(page.getByText('Telemetry', { exact: true })).toHaveCount(0);
         await expect(page.getByText('Device Detail', { exact: true })).toHaveCount(0);
+    });
+
+    test('Card PL2 status is available from the GPU Devices header', async ({ page }) => {
+        await openGpuTab(page);
+
+        await page.locator('text=0000:04:00.0').first().click();
+        const button = page.locator(
+            '.x-btn:has(.x-btn-inner:text-is("Power Limit: Current 60 W / Card PL2"))'
+        ).first();
+        await expect(button).toBeEnabled({ timeout: 10000 });
+        await button.click();
+
+        const dialog = page.locator('.x-window:has-text("Power Limit: 0000:04:00.0")').last();
+        await expect(dialog).toBeVisible({ timeout: 5000 });
+        await expect(dialog).toContainText('Current 60 W / Card PL2');
+        await expect(dialog).toContainText('Boot');
+        await dialog.locator('.x-btn-inner:text-is("Close")').click();
     });
 
     test('SR-IOV prechecks section visible', async ({ page }) => {
@@ -93,6 +111,7 @@ test.describe('GPU Tab', () => {
         await expect(page.locator('text=IOMMU').first()).toBeVisible({ timeout: 5000 });
         await expect(page.locator('text=GPU Driver').first()).toBeVisible({ timeout: 5000 });
         await expect(page.locator('text=Pass').first()).toBeVisible({ timeout: 5000 });
+        await expect(page.getByText('Device scheduler', { exact: false })).toHaveCount(0);
     });
 
     test('SR-IOV VF section visible', async ({ page }) => {
@@ -102,9 +121,14 @@ test.describe('GPU Tab', () => {
         await page.waitForTimeout(2000);
 
         // Verify VF management section
-        await expect(page.locator('text=SR-IOV Virtual Functions').first()).toBeVisible({ timeout: 5000 });
+        await expect(page.getByText('SR-IOV Virtual Functions', { exact: true })).toHaveCount(0);
         await expect(page.getByText('LMEM', { exact: true }).last()).toBeVisible({ timeout: 5000 });
         await expect(page.getByText('VF #', { exact: true })).toBeVisible({ timeout: 5000 });
+        await expect(page.getByText('Live Engine Utilization', { exact: true })).toBeVisible({ timeout: 5000 });
+        await expect(page.getByText('Render', { exact: true })).toBeVisible({ timeout: 5000 });
+        await expect(page.getByText('Compute', { exact: true })).toBeVisible({ timeout: 5000 });
+        await expect(page.getByText('Media', { exact: true })).toBeVisible({ timeout: 5000 });
+        await expect(page.getByText('Copy', { exact: true })).toBeVisible({ timeout: 5000 });
     });
 
     test('whole-GPU quick mode explains the full transaction', async ({ page }) => {

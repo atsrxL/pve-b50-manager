@@ -60,6 +60,7 @@ echo "--- Installation checks ---"
 run_test "Perl module exists" "test -f /usr/share/perl5/PVE/API2/Hardware/GPU.pm"
 run_test "JS plugin exists" "test -f /usr/share/pve-manager/js/pve-gpu-plugin.js"
 run_test "Apply script exists" "test -x /usr/lib/pve-gpu/apply-sriov-config.sh"
+run_test "Power-limit restore script exists" "test -x /usr/lib/pve-gpu/apply-power-limit.sh"
 run_test "JS patch applied" "grep -q pve-gpu-plugin /usr/share/pve-manager/index.html.tpl"
 run_test "Nodes.pm patch applied" "grep -q GPU /usr/share/perl5/PVE/API2/Nodes.pm"
 run_test "Systemd service enabled" "systemctl is-enabled pve-gpu-sriov.service"
@@ -75,6 +76,10 @@ run_test_output "BMG device detail" "e211" \
     "pvesh get /nodes/$HOSTNAME/hardware/gpu/0000:04:00.0 --output-format json"
 run_test_output "BMG telemetry temp" "43" \
     "pvesh get /nodes/$HOSTNAME/hardware/gpu/0000:04:00.0 --output-format json | python3 -c \"import sys,json; print(json.load(sys.stdin)['telemetry']['temperature_c'])\""
+run_test_output "BMG PF resident VRAM" "1024" \
+    "pvesh get /nodes/$HOSTNAME/hardware/gpu/0000:04:00.0 --output-format json | python3 -c \"import sys,json; print(json.load(sys.stdin)['telemetry']['lmem_pf_resident_mb'])\""
+run_test_output "BMG Card PL2" "60" \
+    "pvesh get /nodes/$HOSTNAME/hardware/gpu/0000:04:00.0/power-limit --output-format json | python3 -c \"import sys,json; print(json.load(sys.stdin)['current_w'])\""
 run_test_output "SR-IOV v3 status" "3" \
     "pvesh get /nodes/$HOSTNAME/hardware/gpu/0000:04:00.0/sriov --output-format json | python3 -c \"import sys,json; print(json.load(sys.stdin)['api_version'])\""
 run_test_output "SR-IOV prechecks pass" "True" \

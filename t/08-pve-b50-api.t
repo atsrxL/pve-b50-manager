@@ -14,11 +14,13 @@ $ENV{PATH} = '/usr/sbin:/usr/bin:/sbin:/bin';
 
 my $root = tempdir(CLEANUP => 1);
 my $config = "$root/etc/pve/local/gpu-sriov.conf";
+my $power_limit_config = "$root/etc/pve/local/gpu-power-limit.conf";
 my $qemu_dir = "$root/etc/pve/qemu-server";
 make_path(dirname($config), $qemu_dir);
 
 $ENV{PVE_GPU_SYSFS_ROOT} = $root;
 $ENV{PVE_GPU_SRIOV_CONF} = $config;
+$ENV{PVE_GPU_POWER_LIMIT_CONF} = $power_limit_config;
 $ENV{PVE_GPU_QEMU_CONF_DIR} = $qemu_dir;
 $ENV{PVE_GPU_SRIOV_LOCK} = "$root/sriov.lock";
 $ENV{PVE_GPU_PCI_RESERVATION_LOCK} = "$root/pci-id-reservations.lock";
@@ -65,6 +67,8 @@ make_path("$root/sys/module/xe");
 symlink("$root/sys/module/xe", "$pf_path/driver") or die $!;
 make_path("$root/sys/class/drm/card0");
 symlink($pf_path, "$root/sys/class/drm/card0/device") or die $!;
+write_file("$pf_path/hwmon/hwmon0/name", "xe\n");
+write_file("$pf_path/hwmon/hwmon0/power1_cap", "60000000\n");
 make_path("$root/sys/class/iommu/dmar0");
 write_file("$root/proc/cpuinfo", "flags: vmx\n");
 
@@ -218,6 +222,27 @@ like($@, qr/requires allow_unsafe_scheduler=1/,
     'normal scheduler requires explicit experimental acknowledgement');
 
 my $live_rec = PVE::API2::Hardware::GPU::_collect_device($pf, 0);
+my $power_limit = PVE::API2::Hardware::GPU::_power_limit_status($pf);
+ok(${$power_limit->{supported}}, 'B50 xe Card PL2 is available');
+is($power_limit->{current_w}, 60, 'live Card PL2 is read in watts');
+is($power_limit->{original_w}, 73, 'B50 restore value uses the verified device profile');
+
+my $limited = PVE::API2::Hardware::GPU::_change_power_limit($pf, 'set', 55, 1);
+is($limited->{current_w}, 55, 'Card PL2 changes immediately');
+ok(${$limited->{persistent}}, 'Card PL2 override is marked for boot persistence');
+is($limited->{persistent_w}, 55, 'boot persistence stores the requested Card PL2');
+is(read_file("$pf_path/hwmon/hwmon0/power1_cap"), 55_000_000,
+    'live power1_cap write is verified in microwatts');
+my $power_config = PVE::API2::Hardware::GPU::parse_ini_config($power_limit_config, 1);
+is($power_config->{$pf}{original_w}, 73, 'persistent state retains the original limit');
+is($power_config->{$pf}{persistent_w}, 55, 'persistent state retains the boot limit');
+
+my $restored = PVE::API2::Hardware::GPU::_change_power_limit($pf, 'restore', undef, 0);
+is($restored->{current_w}, 73, 'Restore Original returns Card PL2 to 73 W');
+ok(!${$restored->{persistent}}, 'Restore Original clears boot persistence');
+$power_config = PVE::API2::Hardware::GPU::parse_ini_config($power_limit_config, 1);
+ok(!exists($power_config->{$pf}), 'Restore Original removes the per-BDF override section');
+
 is(PVE::API2::Hardware::GPU::_read_scheduler_priority($live_rec), 'low',
     'scheduler read requires the same value from the PF and every VF');
 write_file("$pf_path/sriov_admin/vf2/profile/sched_priority", '[normal] low');
@@ -259,6 +284,128 @@ is($scheduler_writes, 1,
 }
 
 my $live_vfs = PVE::API2::Hardware::GPU::_vf_records($live_rec);
+
+subtest 'Windows QGA telemetry replaces unattributable BMG scheduling quanta' => sub {
+    my $guest_metrics = PVE::API2::Hardware::GPU::_parse_windows_guest_engine_telemetry(
+        encode_json({
+            adapters => [
+                {
+                    name => 'luid_0x00000000_0x00007BBC_phys_0',
+                    dedicated => 1_896_734_720,
+                    shared => 123_564_032,
+                    committed => 2_328_932_352,
+                },
+                {
+                    name => 'luid_0x00000000_0x00007B55_phys_0',
+                    dedicated => 0,
+                    shared => 16_384,
+                    committed => 3_227_648,
+                },
+            ],
+            engines => [
+                { name => 'pid_11388_luid_0x00000000_0x00007BBC_phys_0_eng_0_engtype_3D', value => 81.5 },
+                { name => 'pid_1560_luid_0x00000000_0x00007BBC_phys_0_eng_0_engtype_3D', value => 3.2 },
+                { name => 'pid_6576_luid_0x00000000_0x00007BBC_phys_0_eng_0_engtype_3D', value => 2.4 },
+                { name => 'pid_6576_luid_0x00000000_0x00007BBC_phys_0_eng_1_engtype_VideoDecode', value => 7.6 },
+                { name => 'pid_9999_luid_0x00000000_0x00007B55_phys_0_eng_0_engtype_3D', value => 99 },
+            ],
+        }),
+    );
+    is($guest_metrics->{gpu_util_pct}, 87.1,
+        'overall guest GPU is the busiest physical B50 engine');
+    is($guest_metrics->{render_util_pct}, 87.1,
+        '3D clients sharing one engine are summed once');
+    is($guest_metrics->{compute_util_pct}, 0,
+        'Compute remains independent from overall GPU and Render');
+    is($guest_metrics->{media_util_pct}, 7.6,
+        'VideoDecode is grouped under Media');
+
+    write_file("$qemu_dir/202.conf", "hostpci0: 0000:0b:00.2,rombar=0,pcie=1\n");
+    {
+        no warnings 'redefine';
+        local *PVE::API2::Hardware::GPU::_vm_is_running = sub { return $_[0] == 202 };
+        local *PVE::API2::Hardware::GPU::_read_windows_guest_engine_telemetry = sub {
+            is($_[0], 202, 'guest telemetry is requested once for the running VM');
+            return $guest_metrics;
+        };
+        local *PVE::API2::Hardware::GPU::Intel::read_engine_telemetry = sub {
+            return {
+                device => {
+                    gpu_util_pct => 16.7,
+                    render_util_pct => 0,
+                    compute_util_pct => 16.7,
+                    media_util_pct => 0,
+                    copy_util_pct => 0,
+                },
+                host_pf => { gpu_util_pct => 0 },
+                vfs => {
+                    1 => { map { $_ => 0 } qw(gpu_util_pct render_util_pct compute_util_pct media_util_pct copy_util_pct) },
+                    2 => { map { $_ => 0 } qw(gpu_util_pct render_util_pct compute_util_pct media_util_pct copy_util_pct) },
+                },
+                active_ticks_by_function => { 0 => 50, 1 => 0, 2 => 0 },
+            };
+        };
+        my $vfs = PVE::API2::Hardware::GPU::_vf_records($live_rec, 1);
+        is($vfs->[0]{compute_util_pct}, 0,
+            'stopped VF keeps its direct idle PMU value');
+        is($vfs->[1]{gpu_util_pct}, 87.1,
+            'running VF receives the live guest overall GPU value');
+        is($vfs->[1]{render_util_pct}, 87.1,
+            'running VF receives the guest 3D value as Render');
+        is($vfs->[1]{compute_util_pct}, 0,
+            'running VF does not relabel 3D work as Compute');
+        is($vfs->[1]{engine_util_source}, 'windows-pdh-qga',
+            'guest-assisted utilization is explicitly labelled');
+    }
+
+    {
+        no warnings 'redefine';
+        local *PVE::API2::Hardware::GPU::_vm_is_running = sub { return $_[0] == 202 };
+        local *PVE::API2::Hardware::GPU::_read_windows_guest_engine_telemetry = sub { return undef };
+        local *PVE::API2::Hardware::GPU::Intel::read_engine_telemetry = sub {
+            return {
+                device => { gpu_util_pct => 16.7, compute_util_pct => 16.7 },
+                host_pf => { gpu_util_pct => 0 },
+                vfs => {
+                    1 => { gpu_util_pct => 0, compute_util_pct => 0 },
+                    2 => { gpu_util_pct => 0, compute_util_pct => 0 },
+                },
+                active_ticks_by_function => { 0 => 50, 1 => 0, 2 => 0 },
+            };
+        };
+        my $vfs = PVE::API2::Hardware::GPU::_vf_records($live_rec, 1);
+        is($vfs->[1]{compute_util_pct}, undef,
+            'function 0 scheduling quanta are hidden when guest telemetry is unavailable');
+        is($vfs->[1]{engine_util_source}, 'xe-pmu-attribution-unavailable',
+            'unavailable actual utilization is explicit rather than fixed at 50 percent');
+    }
+
+    write_file("$qemu_dir/201.conf", "hostpci0: 0000:0b:00.1,rombar=0,pcie=1\n");
+    {
+        no warnings 'redefine';
+        local *PVE::API2::Hardware::GPU::_vm_is_running = sub { return 1 };
+        local *PVE::API2::Hardware::GPU::_read_windows_guest_engine_telemetry = sub { return undef };
+        local *PVE::API2::Hardware::GPU::Intel::read_engine_telemetry = sub {
+            return {
+                device => { gpu_util_pct => 16.7, compute_util_pct => 16.7 },
+                host_pf => { gpu_util_pct => 0 },
+                vfs => {
+                    1 => { gpu_util_pct => 0, compute_util_pct => 0 },
+                    2 => { gpu_util_pct => 0, compute_util_pct => 0 },
+                },
+                active_ticks_by_function => { 0 => 50, 1 => 0, 2 => 0 },
+            };
+        };
+        my $vfs = PVE::API2::Hardware::GPU::_vf_records($live_rec, 1);
+        is($vfs->[0]{compute_util_pct}, undef,
+            'multiple running VFs are not given invented utilization');
+        is($vfs->[1]{engine_util_source}, 'xe-pmu-attribution-unavailable',
+            'ambiguous multi-VF attribution is explicitly labelled');
+    }
+    unlink("$qemu_dir/201.conf") or die $!;
+    unlink("$qemu_dir/202.conf") or die $!;
+};
+
 my $missing_persistence = PVE::API2::Hardware::GPU::_calculate_persistence_drift(
     $live_rec,
     {},

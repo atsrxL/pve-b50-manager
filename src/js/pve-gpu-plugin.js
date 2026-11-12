@@ -3,7 +3,7 @@
  * ExtJS 7 frontend for supported Intel Battlemage SR-IOV management
  *
  * Registers a "GPU" tab in PVE.node.Config with:
- *   - Device grid (auto-refresh 30s)
+ *   - Device grid with opt-in, page-scoped one-second auto-refresh
  *   - Device detail panel (properties, telemetry, SR-IOV management)
  *   - VF lifecycle management (create, remove)
  *   - Drift warning banner
@@ -61,6 +61,29 @@ function gpuTelemetrySleeping(telemetry) {
     return !!telemetry && gpuAtsBoolean(telemetry.sleeping);
 }
 
+function gpuUtilisationRenderer(value, meta, record) {
+    var source = record && record.get ? record.get('engine_util_source') : null;
+    if (meta && source === 'windows-pdh-qga') {
+        meta.tdAttr = 'data-qtip="' + Ext.htmlEncode(gettext(
+            'Live Windows GPU Engine counters read through QEMU Guest Agent. GPU is the busiest physical engine; Render is the 3D engine.'
+        )) + '"';
+    } else if (meta && source === 'xe-pmu-attribution-unavailable') {
+        meta.tdAttr = 'data-qtip="' + Ext.htmlEncode(gettext(
+            'Xe reports VF work under function 0 as GuC scheduling quanta, so actual per-VF engine utilization is unavailable without guest telemetry.'
+        )) + '"';
+    }
+    if (value === null || value === undefined || value === '') {
+        return '<span style="color:#888;">-</span>';
+    }
+    var pct = Math.max(0, Math.min(100, parseFloat(value)));
+    if (isNaN(pct)) {
+        return '<span style="color:#888;">-</span>';
+    }
+    var colour = pct > 80 ? '#e84040' : (pct > 50 ? '#f0a020' : '#26a826');
+    return '<span style="color:' + colour + ';font-weight:bold;">' +
+        pct.toFixed(1) + '%</span>';
+}
+
 /**
  * The ATS endpoint is deliberately fail-closed when a field is missing.
  * @param {Object} policy
@@ -113,6 +136,7 @@ Ext.define('PVE.store.GpuDevices', {
         { name: 'pf_assigned', type: 'boolean' },
         { name: 'pf_vmid', type: 'auto' },
         { name: 'vfio_configured', type: 'boolean' },
+        { name: 'power_limit', type: 'auto' },
         { name: 'power_mode', type: 'string', defaultValue: 'normal' }
     ],
 
@@ -312,7 +336,9 @@ Ext.define('PVE.grid.GpuDeviceGrid', {
     // PVE.StateProvider extends Ext.state.LocalStorageProvider, so native
     // grid state keeps user-resized columns in this browser across reloads.
     stateful: true,
-    stateId: 'grid-pve-gpu-devices-v1',
+    // v2 applies the new default-visible column set once, then continues to
+    // persist the user's column widths and visibility choices locally.
+    stateId: 'grid-pve-gpu-devices-v3',
 
     config: {
         pveSelNode: null
@@ -405,34 +431,55 @@ Ext.define('PVE.grid.GpuDeviceGrid', {
             }
         },
         {
-            header: gettext('Freq'),
+            header: gettext('Cur Freq'),
             dataIndex: 'telemetry',
-            width: 90,
+            width: 95,
             align: 'center',
             renderer: function(telemetry) {
-                if (!telemetry || !telemetry.clock_mhz) { return '-'; }
-                var text = telemetry.clock_mhz + ' MHz';
-                if (telemetry.clock_max_mhz && telemetry.clock_max_mhz !== telemetry.clock_mhz) {
-                    text += ' / ' + telemetry.clock_max_mhz;
-                }
-                return text;
+                if (!telemetry || telemetry.clock_mhz === null ||
+                    telemetry.clock_mhz === undefined) { return '-'; }
+                return telemetry.clock_mhz + ' MHz';
             }
         },
         {
-            header: gettext('LMEM / VRAM'),
+            header: gettext('Max Freq'),
+            dataIndex: 'telemetry',
+            width: 95,
+            align: 'center',
+            hidden: true,
+            hideable: true,
+            renderer: function(telemetry) {
+                if (!telemetry || telemetry.clock_max_mhz === null ||
+                    telemetry.clock_max_mhz === undefined) { return '-'; }
+                return telemetry.clock_max_mhz + ' MHz';
+            }
+        },
+        {
+            header: gettext('PF VRAM'),
             dataIndex: 'telemetry',
             width: 140,
-            renderer: function(telemetry) {
+            renderer: function(telemetry, meta) {
                 if (!telemetry || telemetry.lmem_total_mb === null || telemetry.lmem_total_mb === undefined) {
                     return '-';
                 }
                 var total = telemetry.lmem_total_mb;
-                var used = telemetry.lmem_used_mb || 0;
+                var used = telemetry.lmem_pf_resident_mb;
+                if (used === null || used === undefined) {
+                    used = telemetry.lmem_used_mb;
+                }
+                used = used || 0;
                 var totalGiB = (total / 1024).toFixed(1);
                 var usedGiB = (used / 1024).toFixed(1);
                 var pct = total > 0 ? Math.round((used / total) * 100) : 0;
                 var colour = pct > 80 ? '#e84040' : (pct > 50 ? '#f0a020' : '#26a826');
-                return '<span style="color:' + colour + ';">' + usedGiB + '/' + totalGiB + ' GiB</span>';
+                if (telemetry.lmem_allocator_used_mb !== null &&
+                    telemetry.lmem_allocator_used_mb !== undefined) {
+                    meta.tdAttr = 'data-qtip="' + Ext.htmlEncode(
+                        gettext('Whole-card allocator usage (includes VF quotas)') + ': ' +
+                        (telemetry.lmem_allocator_used_mb / 1024).toFixed(1) + ' GiB'
+                    ) + '"';
+                }
+                return '<span style="color:' + colour + ';">PF ' + usedGiB + '/' + totalGiB + ' GiB</span>';
             }
         },
         {
@@ -478,12 +525,16 @@ Ext.define('PVE.grid.GpuDeviceGrid', {
             header: gettext('Max VFs'),
             dataIndex: 'sriov_maxvfs',
             width: 60,
-            align: 'center'
+            align: 'center',
+            hidden: true,
+            hideable: true
         },
         {
             header: gettext('VMs'),
             dataIndex: 'assigned_vms',
             width: 100,
+            hidden: true,
+            hideable: true,
             renderer: function(vms) {
                 if (!vms || !vms.length) { return '\u2014'; }
                 return vms.join(', ');
@@ -550,10 +601,18 @@ Ext.define('PVE.grid.GpuDeviceGrid', {
     tbar: [
         {
             xtype: 'button',
-            text: gettext('Refresh'),
-            iconCls: 'fa fa-refresh',
-            handler: function() {
-                this.up('gpuDeviceGrid').reload();
+            itemId: 'autoRefreshBtn',
+            text: gettext('Auto Refresh'),
+            iconCls: 'fa fa-play',
+            enableToggle: true,
+            pressed: false,
+            toggleHandler: function(button, pressed) {
+                button.setIconCls(pressed ? 'fa fa-pause' : 'fa fa-play');
+                button.setText(pressed ?
+                    gettext('Auto Refresh: On') : gettext('Auto Refresh'));
+                button.up('gpuDeviceGrid').fireEvent(
+                    'autorefreshchange', button.up('gpuDeviceGrid'), pressed
+                );
             }
         }
     ],
@@ -565,6 +624,17 @@ Ext.define('PVE.grid.GpuDeviceGrid', {
         // consuming permanent workspace below the device list.
         me.header = {
             items: [
+                {
+                    xtype: 'button',
+                    itemId: 'powerLimitBtn',
+                    text: gettext('Power Limit'),
+                    iconCls: 'fa fa-bolt',
+                    disabled: true,
+                    handler: function() {
+                        var selected = me.getSelectionModel().getSelection();
+                        me.fireEvent('powerlimitclick', me, selected.length ? selected[0] : null);
+                    }
+                },
                 {
                     xtype: 'button',
                     itemId: 'powerPolicyBtn',
@@ -593,10 +663,30 @@ Ext.define('PVE.grid.GpuDeviceGrid', {
         me.callParent();
 
         me.reloadRequestId = 0;
+        me.reloadInFlight = false;
 
         me.on('selectionchange', function(selModel, records) {
             var rec = records.length > 0 ? records[0] : null;
+            if (!rec && me.reloadInFlight) {
+                // loadData temporarily clears the selection.  Keep the
+                // selected detail workspace alive until its BDF is restored.
+                return;
+            }
             var powerActive = rec && (rec.get('power_mode') || 'normal') !== 'normal';
+            var powerLimit = rec && rec.get('power_limit');
+            var powerLimitSupported = powerLimit && gpuAtsBoolean(powerLimit.supported);
+            var powerLimitText = gettext('Power Limit');
+            if (powerLimitSupported && powerLimit.current_w !== null &&
+                powerLimit.current_w !== undefined) {
+                var currentLimit = Number(powerLimit.current_w);
+                var currentLimitText = Math.round(currentLimit * 10) % 10 === 0 ?
+                    currentLimit.toFixed(0) : currentLimit.toFixed(1);
+                powerLimitText += ': ' + gettext('Current') + ' ' +
+                    currentLimitText + ' W / ' +
+                    gettext('Card PL2');
+            }
+            me.down('#powerLimitBtn').setText(powerLimitText);
+            me.down('#powerLimitBtn').setDisabled(!rec || powerActive || !powerLimitSupported);
             me.down('#powerPolicyBtn').setDisabled(!rec);
             me.down('#atsPolicyBtn').setDisabled(!rec || powerActive);
             me.fireEvent('deviceselect', me, rec);
@@ -619,33 +709,37 @@ Ext.define('PVE.grid.GpuDeviceGrid', {
             me.fireEvent('devicedblclick', me, record);
         });
 
-        me.taskRunner = new Ext.util.TaskRunner();
-
         me.on('afterrender', function() {
             me.reload();
-            me.refreshTask = me.taskRunner.start({
-                run: function() { me.reload(); },
-                interval: 30000
-            });
         });
 
         me.on('destroy', function() {
-            if (me.refreshTask) {
-                me.taskRunner.stop(me.refreshTask);
-            }
+            me.reloadRequestId++;
+            me.reloadInFlight = false;
         });
     },
 
-    reload: function(preferredBdf) {
+    setAutoRefreshEnabled: function(enabled, suppressEvent) {
+        var button = this.down('#autoRefreshBtn');
+        if (!button) {
+            return;
+        }
+        button.toggle(!!enabled, !!suppressEvent);
+        button.setIconCls(enabled ? 'fa fa-pause' : 'fa fa-play');
+        button.setText(enabled ? gettext('Auto Refresh: On') : gettext('Auto Refresh'));
+    },
+
+    reload: function(preferredBdf, quiet) {
         var me = this;
         var nodeName = me.pveSelNode && me.pveSelNode.data ? me.pveSelNode.data.node : undefined;
-        if (!nodeName) {
-            return;
+        if (!nodeName || me.reloadInFlight) {
+            return false;
         }
 
         var selected = me.getSelectionModel().getSelection();
         var selectedBdf = preferredBdf || (selected.length ? selected[0].get('bdf') : null);
         var requestId = ++me.reloadRequestId;
+        me.reloadInFlight = true;
 
         Proxmox.Utils.API2Request({
             url: '/nodes/' + encodeURIComponent(nodeName) + '/hardware/gpu',
@@ -682,18 +776,24 @@ Ext.define('PVE.grid.GpuDeviceGrid', {
                         me.getSelectionModel().deselectAll();
                         me.fireEvent('deviceselect', me, null);
                     }
+                    me.fireEvent('devicesreloaded', me, data);
                 }
+                me.reloadInFlight = false;
             },
             failure: function(response, opts, error) {
                 if (requestId !== me.reloadRequestId) {
                     return;
                 }
-                Ext.Msg.alert(gettext('Error'), Ext.String.format(
-                    gettext('Failed to load GPU devices: {0}'),
-                    error || response.htmlStatus
-                ));
+                me.reloadInFlight = false;
+                if (!quiet) {
+                    Ext.Msg.alert(gettext('Error'), Ext.String.format(
+                        gettext('Failed to load GPU devices: {0}'),
+                        error || response.htmlStatus
+                    ));
+                }
             }
         });
+        return true;
     },
 
     openVfioDialog: function(record) {
@@ -996,20 +1096,10 @@ Ext.define('PVE.panel.GpuTelemetryCard', {
 
         me.callParent();
 
-        me.taskRunner = new Ext.util.TaskRunner();
         me.telemetryRequestId = 0;
 
-        me.on('afterrender', function() {
-            me.refreshTask = me.taskRunner.start({
-                run: function() { me.reloadTelemetry(); },
-                interval: 10000
-            });
-        });
-
         me.on('destroy', function() {
-            if (me.refreshTask) {
-                me.taskRunner.stop(me.refreshTask);
-            }
+            me.telemetryRequestId++;
         });
     },
 
@@ -1022,10 +1112,10 @@ Ext.define('PVE.panel.GpuTelemetryCard', {
             return;
         }
         me.currentBdf = record.get('bdf');
-        // Render telemetry from the device record immediately
+        // The page-level auto-refresh controller owns all polling.  This card
+        // only renders a supplied record and never creates an independent
+        // timer which could keep waking a hidden GPU page.
         me.updateDisplay(record.get('telemetry'));
-        // Then kick off auto-refresh loop
-        me.reloadTelemetry();
     },
 
     reloadTelemetry: function() {
@@ -1102,11 +1192,14 @@ Ext.define('PVE.panel.GpuTelemetryCard', {
             fanVal.setText(rpm !== null && rpm !== undefined ? String(rpm) : '-');
         }
 
-        // Memory bar (uses lmem_total_mb and lmem_used_mb from backend)
+        // PF resident memory uses DRM fdinfo (the same accounting as nvtop).
         var memBar = me.down('#memBar');
         var memRange = me.down('#memRange');
         var totalMb = telemetry.lmem_total_mb;
-        var usedMb = telemetry.lmem_used_mb;
+        var usedMb = telemetry.lmem_pf_resident_mb;
+        if (usedMb === null || usedMb === undefined) {
+            usedMb = telemetry.lmem_used_mb;
+        }
         if (memBar && totalMb !== null && totalMb !== undefined && totalMb > 0) {
             var used = usedMb || 0;
             var memPct = Math.min(used / totalMb, 1);
@@ -1173,7 +1266,7 @@ Ext.define('PVE.panel.GpuPrecheckBar', {
                 flex: 1,
                 margin: '0 4',
                 padding: 6,
-                style: 'border:1px solid #ddd;border-radius:4px;background:#f5f5f5;',
+                style: 'border:1px solid #ddd;border-radius:4px;background:#f5f5f5;color:#2b2b2b;',
                 layout: { type: 'vbox', align: 'center' },
                 items: [
                     {
@@ -1184,13 +1277,13 @@ Ext.define('PVE.panel.GpuPrecheckBar', {
                     {
                         xtype: 'label',
                         text: check.label,
-                        style: 'font-size:11px;margin-top:4px;text-align:center;'
+                        style: 'font-size:11px;margin-top:4px;text-align:center;color:#2b2b2b !important;'
                     },
                     {
                         xtype: 'label',
                         itemId: 'msg',
                         text: '',
-                        style: 'font-size:10px;color:#888;text-align:center;margin-top:2px;'
+                        style: 'font-size:10px;color:#555 !important;text-align:center;margin-top:2px;'
                     }
                 ]
             };
@@ -1435,7 +1528,13 @@ Ext.define('PVE.store.GpuVfs', {
         { name: 'resources', type: 'auto' },
         { name: 'assigned', type: 'auto' },
         { name: 'running', type: 'auto' },
-        { name: 'vmid', type: 'auto' }
+        { name: 'vmid', type: 'auto' },
+        { name: 'gpu_util_pct', type: 'auto' },
+        { name: 'render_util_pct', type: 'auto' },
+        { name: 'compute_util_pct', type: 'auto' },
+        { name: 'media_util_pct', type: 'auto' },
+        { name: 'copy_util_pct', type: 'auto' },
+        'engine_util_source'
     ],
 
     proxy: {
@@ -2882,6 +2981,298 @@ Ext.define('PVE.window.WholeGpuPassthroughDialog', {
 });
 
 /* =========================================================================
+ * GpuPowerLimitDialog — live and boot-persistent xe Card PL2
+ * ========================================================================= */
+
+Ext.define('PVE.window.GpuPowerLimitDialog', {
+    extend: 'Ext.window.Window',
+    alias: 'widget.gpuPowerLimitDialog',
+
+    modal: true,
+    width: 640,
+    minHeight: 360,
+    layout: 'fit',
+    closeAction: 'destroy',
+
+    config: {
+        pveSelNode: null,
+        deviceRecord: null
+    },
+
+    initComponent: function() {
+        var me = this;
+        var record = me.deviceRecord;
+        me.currentBdf = record ? record.get('bdf') : null;
+        me.status = record ? record.get('power_limit') : null;
+        me.statusRequestId = 0;
+        me.actionRequestId = 0;
+        me.actionInFlight = false;
+        me.settingField = false;
+        me.userEdited = false;
+        me.title = Ext.String.format(
+            gettext('Power Limit: {0}'), me.currentBdf || '-'
+        );
+
+        me.items = [
+            {
+                xtype: 'form',
+                itemId: 'powerLimitForm',
+                border: false,
+                bodyPadding: 14,
+                defaults: { anchor: '100%', labelWidth: 155 },
+                items: [
+                    {
+                        xtype: 'component',
+                        itemId: 'powerLimitSummary',
+                        margin: '0 0 14 0',
+                        html: ''
+                    },
+                    {
+                        xtype: 'numberfield',
+                        itemId: 'powerLimitWatts',
+                        fieldLabel: gettext('Card PL2'),
+                        minValue: 1,
+                        maxValue: 300,
+                        decimalPrecision: 1,
+                        step: 1,
+                        allowBlank: false,
+                        suffix: ' W',
+                        listeners: {
+                            change: function() {
+                                if (!me.settingField) {
+                                    me.userEdited = true;
+                                }
+                            }
+                        }
+                    },
+                    {
+                        xtype: 'checkbox',
+                        itemId: 'powerLimitPersist',
+                        fieldLabel: gettext('Boot persistence'),
+                        boxLabel: gettext('Reapply this value after the xe driver loads')
+                    },
+                    {
+                        xtype: 'component',
+                        margin: '14 0 0 0',
+                        padding: 9,
+                        style: 'background:#f7f7f7;border:1px solid #ddd;color:#555;',
+                        html: Ext.htmlEncode(gettext(
+                            'Card PL2 is the xe whole-card burst power limit. It applies to the PF and every VF; it is not a per-VF TDP control.'
+                        ))
+                    }
+                ]
+            }
+        ];
+
+        me.buttons = [
+            {
+                itemId: 'applyPowerLimitBtn',
+                text: gettext('Apply Now'),
+                iconCls: 'fa fa-bolt',
+                disabled: true,
+                handler: function() { me.applyLimit(); }
+            },
+            {
+                itemId: 'restorePowerLimitBtn',
+                text: gettext('Restore Original'),
+                iconCls: 'fa fa-undo',
+                disabled: true,
+                handler: function() { me.confirmRestore(); }
+            },
+            {
+                text: gettext('Close'),
+                handler: function() { me.close(); }
+            }
+        ];
+
+        me.callParent();
+        me.on('destroy', function() {
+            me.statusRequestId++;
+            me.actionRequestId++;
+        });
+        me.updateView();
+        me.reloadStatus();
+    },
+
+    nodeName: function() {
+        return this.pveSelNode && this.pveSelNode.data ?
+            this.pveSelNode.data.node : undefined;
+    },
+
+    formatWatts: function(value) {
+        if (value === null || value === undefined || isNaN(Number(value))) {
+            return '-';
+        }
+        var number = Number(value);
+        return (Math.round(number * 10) % 10 === 0 ?
+            number.toFixed(0) : number.toFixed(1)) + ' W';
+    },
+
+    isCurrent: function(bdf, requestId, action) {
+        return this.currentBdf === bdf &&
+            requestId === (action ? this.actionRequestId : this.statusRequestId) &&
+            !this.destroyed && !this.isDestroyed;
+    },
+
+    reloadStatus: function() {
+        var me = this;
+        var nodeName = me.nodeName();
+        var bdf = me.currentBdf;
+        if (!nodeName || !bdf) {
+            return;
+        }
+        var requestId = ++me.statusRequestId;
+        me.setLoading(true);
+        Proxmox.Utils.API2Request({
+            url: '/nodes/' + encodeURIComponent(nodeName) +
+                '/hardware/gpu/' + encodeURIComponent(bdf) + '/power-limit',
+            method: 'GET',
+            success: function(response) {
+                if (!me.isCurrent(bdf, requestId, false)) {
+                    return;
+                }
+                me.setLoading(false);
+                me.status = (response.result && response.result.data) || null;
+                me.updateView();
+            },
+            failure: function(response, opts, error) {
+                if (!me.isCurrent(bdf, requestId, false)) {
+                    return;
+                }
+                me.setLoading(false);
+                me.status = null;
+                me.updateView();
+                Ext.Msg.alert(gettext('Error'), error || response.htmlStatus);
+            }
+        });
+    },
+
+    updateView: function() {
+        var me = this;
+        var status = me.status || {};
+        var supported = gpuAtsBoolean(status.supported);
+        var writable = gpuAtsBoolean(status.writable);
+        var current = status.current_w;
+        var original = status.original_w;
+        var persistent = gpuAtsBoolean(status.persistent);
+        var summary = me.down('#powerLimitSummary');
+        var field = me.down('#powerLimitWatts');
+        var persistField = me.down('#powerLimitPersist');
+        var apply = me.down('#applyPowerLimitBtn');
+        var restore = me.down('#restorePowerLimitBtn');
+        if (!summary || !field || !persistField || !apply || !restore) {
+            return;
+        }
+
+        var html;
+        if (!supported) {
+            html = '<div style="background:#fff3cd;border:1px solid #e0ae38;padding:10px;color:#5d4600;">' +
+                Ext.htmlEncode(status.reason || gettext('Card PL2 is unavailable.')) + '</div>';
+        } else {
+            html = '<div style="border:1px solid #ddd;background:#f7f7f7;padding:10px;color:#222;">' +
+                '<div style="font-size:18px;font-weight:bold;margin-bottom:8px;">' +
+                Ext.htmlEncode(gettext('Current') + ' ' + me.formatWatts(current) +
+                    ' / ' + gettext('Card PL2')) + '</div>' +
+                '<div style="color:#555;">' + Ext.htmlEncode(gettext('Original') + ': ' + me.formatWatts(original)) +
+                ' &nbsp; | &nbsp; ' + Ext.htmlEncode(gettext('Boot') + ': ' +
+                    (persistent ? me.formatWatts(status.persistent_w) : gettext('Not persisted'))) +
+                '</div></div>';
+            if (status.config_error) {
+                html += '<div style="margin-top:8px;background:#fde2e2;border:1px solid #d66;padding:8px;color:#7a1d1d;">' +
+                    Ext.htmlEncode(String(status.config_error)) + '</div>';
+            }
+        }
+        summary.setHtml(html);
+
+        if (supported && !me.userEdited && current !== null && current !== undefined) {
+            me.settingField = true;
+            field.setValue(current);
+            persistField.setValue(persistent);
+            me.settingField = false;
+        }
+        field.setDisabled(!supported || !writable || me.actionInFlight);
+        persistField.setDisabled(!supported || !writable || me.actionInFlight);
+        apply.setDisabled(!supported || !writable || me.actionInFlight || !!status.config_error);
+        restore.setDisabled(!supported || !writable || me.actionInFlight ||
+            original === null || original === undefined || !!status.config_error);
+    },
+
+    applyLimit: function() {
+        var me = this;
+        var form = me.down('#powerLimitForm').getForm();
+        if (!form.isValid() || me.actionInFlight) {
+            return;
+        }
+        me.runAction({
+            action: 'set',
+            watts: me.down('#powerLimitWatts').getValue(),
+            persist: me.down('#powerLimitPersist').getValue() ? 1 : 0
+        });
+    },
+
+    confirmRestore: function() {
+        var me = this;
+        if (me.actionInFlight || !me.status) {
+            return;
+        }
+        Ext.Msg.confirm(
+            gettext('Restore Original'),
+            Ext.String.format(
+                gettext('Restore Card PL2 to {0} and remove the boot override?'),
+                me.formatWatts(me.status.original_w)
+            ),
+            function(answer) {
+                if (answer === 'yes') {
+                    me.runAction({ action: 'restore' });
+                }
+            }
+        );
+    },
+
+    runAction: function(params) {
+        var me = this;
+        var nodeName = me.nodeName();
+        var bdf = me.currentBdf;
+        if (!nodeName || !bdf || me.actionInFlight) {
+            return;
+        }
+        var requestId = ++me.actionRequestId;
+        me.actionInFlight = true;
+        me.updateView();
+        me.setLoading(true);
+        Proxmox.Utils.API2Request({
+            url: '/nodes/' + encodeURIComponent(nodeName) +
+                '/hardware/gpu/' + encodeURIComponent(bdf) + '/power-limit',
+            method: 'POST',
+            params: params,
+            success: function(response) {
+                if (!me.isCurrent(bdf, requestId, true)) {
+                    return;
+                }
+                me.setLoading(false);
+                me.actionInFlight = false;
+                me.userEdited = false;
+                me.status = (response.result && response.result.data) || null;
+                me.updateView();
+                me.fireEvent('powerlimitchange', me, bdf, me.status);
+                Ext.toast(params.action === 'restore' ?
+                    gettext('Original Card PL2 restored.') :
+                    gettext('Card PL2 applied immediately.'));
+            },
+            failure: function(response, opts, error) {
+                if (!me.isCurrent(bdf, requestId, true)) {
+                    return;
+                }
+                me.setLoading(false);
+                me.actionInFlight = false;
+                me.updateView();
+                Ext.Msg.alert(gettext('Error'), error || response.htmlStatus);
+            }
+        });
+    }
+});
+
+/* =========================================================================
  * GpuPowerPolicyDialog — runtime-only B50 deep idle
  * ========================================================================= */
 
@@ -3649,7 +4040,7 @@ Ext.define('PVE.panel.GpuSriovPanel', {
     extend: 'Ext.panel.Panel',
     alias: 'widget.gpuSriovPanel',
 
-    title: gettext('SR-IOV Virtual Functions'),
+    header: false,
     layout: { type: 'vbox', align: 'stretch' },
 
     config: {
@@ -3664,6 +4055,7 @@ Ext.define('PVE.panel.GpuSriovPanel', {
         me.vfDataLoaded = false;
         me.sriovRequestId = 0;
         me.vfRequestId = 0;
+        me.vfReloadInFlight = false;
         // Whole-GPU writes are gated by the separately loaded ATS policy.
         // Ordinary VF inspection and assignment do not use this gate.
         me.atsPolicy = null;
@@ -3680,13 +4072,6 @@ Ext.define('PVE.panel.GpuSriovPanel', {
                 }
             },
             {
-                xtype: 'component',
-                itemId: 'schedulerStatus',
-                padding: '6 8',
-                style: 'border-bottom:1px solid #ddd;color:#666;',
-                html: Ext.htmlEncode(gettext('Scheduler: loading...'))
-            },
-            {
                 xtype: 'gpuPrecheckBar',
                 itemId: 'precheckBar'
             },
@@ -3699,7 +4084,7 @@ Ext.define('PVE.panel.GpuSriovPanel', {
                 // Keep VF column sizing separate from the physical-device
                 // table while using PVE's browser-local state provider.
                 stateful: true,
-                stateId: 'grid-pve-gpu-vfs-v1',
+                stateId: 'grid-pve-gpu-vfs-v2',
                 store: { type: 'gpuVfs' },
                 columns: [
                     { header: gettext('VF #'), dataIndex: 'vf_index', width: 60, align: 'center' },
@@ -3708,6 +4093,31 @@ Ext.define('PVE.panel.GpuSriovPanel', {
                         renderer: function(val) {
                             return '<span class="x-monospace">' + Ext.htmlEncode(val || '-') + '</span>';
                         }
+                    },
+                    {
+                        header: gettext('Live Engine Utilization'),
+                        columns: [
+                            {
+                                header: gettext('GPU'), dataIndex: 'gpu_util_pct',
+                                width: 68, align: 'center', renderer: gpuUtilisationRenderer
+                            },
+                            {
+                                header: gettext('Render'), dataIndex: 'render_util_pct',
+                                width: 72, align: 'center', renderer: gpuUtilisationRenderer
+                            },
+                            {
+                                header: gettext('Compute'), dataIndex: 'compute_util_pct',
+                                width: 78, align: 'center', renderer: gpuUtilisationRenderer
+                            },
+                            {
+                                header: gettext('Media'), dataIndex: 'media_util_pct',
+                                width: 72, align: 'center', renderer: gpuUtilisationRenderer
+                            },
+                            {
+                                header: gettext('Copy'), dataIndex: 'copy_util_pct',
+                                width: 68, align: 'center', renderer: gpuUtilisationRenderer
+                            }
+                        ]
                     },
                     {
                         header: gettext('LMEM'), dataIndex: 'resources', width: 155,
@@ -3803,6 +4213,7 @@ Ext.define('PVE.panel.GpuSriovPanel', {
         me.atsPolicyBdf = null;
         me.sriovRequestId++;
         me.vfRequestId++;
+        me.vfReloadInFlight = false;
 
         var vfGrid = me.down('#vfGrid');
         vfGrid.getStore().removeAll();
@@ -3811,14 +4222,10 @@ Ext.define('PVE.panel.GpuSriovPanel', {
         me.down('#driftBanner').hide();
         me.down('#precheckBar').loadPrechecks(null);
         me.down('#precheckBar').show();
-        me.down('#schedulerStatus').setHtml(
-            Ext.htmlEncode(gettext('Scheduler: loading...'))
-        );
 
         var maxVfs = deviceRecord ? (deviceRecord.get('sriov_maxvfs') || 0) : 0;
         var driver = deviceRecord ? (deviceRecord.get('driver') || '') : '';
         if (maxVfs <= 0 && driver !== 'vfio-pci') {
-            me.setTitle(gettext('SR-IOV Virtual Functions'));
             me.hide();
             return;
         }
@@ -3826,15 +4233,8 @@ Ext.define('PVE.panel.GpuSriovPanel', {
 
         // Disable SR-IOV management when PF is assigned to a VM (whole-GPU passthrough)
         var pfAssigned = deviceRecord.get('pf_assigned');
-        var pfVmid = deviceRecord.get('pf_vmid');
         if (pfAssigned) {
             me.enable();
-            me.setTitle(gettext('SR-IOV Virtual Functions') + ' \u2014 ' +
-                Ext.String.format(gettext('GPU assigned to VM {0}'), pfVmid || '?'));
-            me.down('#schedulerStatus').setHtml(
-                '<strong>' + Ext.htmlEncode(gettext('Device scheduler')) + ':</strong> ' +
-                Ext.htmlEncode(gettext('Unavailable while the PF is bound to vfio-pci'))
-            );
             me.down('#precheckBar').hide();
             me.down('#modifyVfsBtn').setDisabled(true);
             me.updateWholeGpuButton();
@@ -3843,7 +4243,6 @@ Ext.define('PVE.panel.GpuSriovPanel', {
         }
 
         me.enable();
-        me.setTitle(gettext('SR-IOV Virtual Functions'));
         me.reloadSriov();
         me.reloadVfs();
     },
@@ -3894,27 +4293,6 @@ Ext.define('PVE.panel.GpuSriovPanel', {
                     });
                 }
 
-                var schedulerStatus = me.down('#schedulerStatus');
-                if (schedulerStatus) {
-                    var priority = data.scheduler_priority || gettext('Unavailable');
-                    var colour = priority === 'low' ? '#2673b8' : '#b06b00';
-                    var suffix;
-                    if (priority === 'normal') {
-                        suffix = ' — ' + gettext('experimental on Intel B50');
-                    } else if (priority === 'low') {
-                        suffix = ' — ' + gettext('recommended');
-                    } else if (priority === 'mixed') {
-                        suffix = ' — ' + gettext('inconsistent across VFs');
-                    } else {
-                        suffix = '';
-                    }
-                    schedulerStatus.setHtml(
-                        '<strong>' + Ext.htmlEncode(gettext('Device scheduler')) + ':</strong> ' +
-                        '<span style="color:' + colour + ';font-weight:bold;">' +
-                        Ext.htmlEncode(String(priority)) + '</span>' + Ext.htmlEncode(suffix)
-                    );
-                }
-
                 me.updateModifyButton();
                 me.updateWholeGpuButton();
             },
@@ -3934,8 +4312,9 @@ Ext.define('PVE.panel.GpuSriovPanel', {
         var me = this;
         var nodeName = me.pveSelNode && me.pveSelNode.data ? me.pveSelNode.data.node : undefined;
         var bdf = me.deviceRecord ? me.deviceRecord.get('bdf') : null;
-        if (!nodeName || !bdf) { return; }
+        if (!nodeName || !bdf || me.vfReloadInFlight) { return false; }
         var requestId = ++me.vfRequestId;
+        me.vfReloadInFlight = true;
 
         Proxmox.Utils.API2Request({
             url: '/nodes/' + encodeURIComponent(nodeName) +
@@ -3945,6 +4324,7 @@ Ext.define('PVE.panel.GpuSriovPanel', {
                 if (requestId !== me.vfRequestId || !me.isCurrentDevice(bdf)) {
                     return;
                 }
+                me.vfReloadInFlight = false;
                 var data = response.result && response.result.data;
                 var store = me.down('#vfGrid').getStore();
                 store.removeAll();
@@ -3959,6 +4339,7 @@ Ext.define('PVE.panel.GpuSriovPanel', {
                 if (requestId !== me.vfRequestId || !me.isCurrentDevice(bdf)) {
                     return;
                 }
+                me.vfReloadInFlight = false;
                 var store = me.down('#vfGrid').getStore();
                 store.removeAll();
                 me.vfDataLoaded = false;
@@ -3966,6 +4347,16 @@ Ext.define('PVE.panel.GpuSriovPanel', {
                 me.updateWholeGpuButton();
             }
         });
+        return true;
+    },
+
+    refreshLiveTelemetry: function() {
+        var record = this.deviceRecord;
+        if (!record || !this.isVisible(true) ||
+            (record.get('power_mode') || 'normal') !== 'normal') {
+            return false;
+        }
+        return this.reloadVfs();
     },
 
     isCurrentDevice: function(bdf) {
@@ -4210,6 +4601,9 @@ Ext.define('PVE.panel.GpuDeviceDetail', {
 
     initComponent: function() {
         var me = this;
+        me.currentBdf = null;
+        me.currentPowerMode = null;
+        me.currentVfCount = null;
 
         me.items = [
             {
@@ -4254,6 +4648,9 @@ Ext.define('PVE.panel.GpuDeviceDetail', {
         var sleepNotice = me.down('#powerSleepNotice');
         var sriovPanel = me.down('#sriovPanel');
         if (!record) {
+            me.currentBdf = null;
+            me.currentPowerMode = null;
+            me.currentVfCount = null;
             me.down('#atsPolicyProbe').loadDevice(null);
             sriovPanel.loadDevice(null);
             sriovPanel.setVisible(true);
@@ -4262,6 +4659,22 @@ Ext.define('PVE.panel.GpuDeviceDetail', {
         }
 
         var powerMode = record.get('power_mode') || 'normal';
+        var bdf = record.get('bdf');
+        var vfCount = record.get('sriov_numvfs') || 0;
+        var sameWorkspace = me.currentBdf === bdf &&
+            me.currentPowerMode === powerMode && me.currentVfCount === vfCount;
+        me.currentBdf = bdf;
+        me.currentPowerMode = powerMode;
+        me.currentVfCount = vfCount;
+
+        // Device-grid telemetry records are replaced on every global tick.
+        // Keep the fresh record without re-running ATS/prechecks/full SR-IOV
+        // discovery when the selected workspace itself did not change.
+        if (sameWorkspace) {
+            sriovPanel.deviceRecord = record;
+            return;
+        }
+
         if (powerMode !== 'normal') {
             // Do not let the hidden ATS probe or SR-IOV/debugfs status reads
             // become the poller which wakes a deliberately sleeping B50.
@@ -4288,6 +4701,10 @@ Ext.define('PVE.panel.GpuDeviceDetail', {
 
     setAtsPolicy: function(policy, bdf) {
         this.down('#sriovPanel').setAtsPolicy(policy, bdf);
+    },
+
+    refreshLiveTelemetry: function() {
+        return this.down('#sriovPanel').refreshLiveTelemetry();
     }
 });
 
@@ -4307,6 +4724,11 @@ Ext.define('PVE.node.GpuManager', {
 
     initComponent: function() {
         var me = this;
+        me.autoRefreshRunner = new Ext.util.TaskRunner();
+        me.autoRefreshTask = null;
+        me.autoRefreshEnabled = false;
+        me.autoRefreshPreferred = false;
+        me.autoRefreshStateKey = 'pve-gpu-auto-refresh-v1';
 
         me.items = [
             // Device grid — north region
@@ -4330,8 +4752,14 @@ Ext.define('PVE.node.GpuManager', {
                     powerpolicyclick: function(grid, record) {
                         me.openPowerPolicyDialog(record);
                     },
+                    powerlimitclick: function(grid, record) {
+                        me.openPowerLimitDialog(record);
+                    },
                     atspolicyclick: function(grid, record) {
                         me.openAtsPolicyDialog(record);
+                    },
+                    autorefreshchange: function(grid, enabled) {
+                        me.setAutoRefreshPreference(enabled);
                     }
                 }
             },
@@ -4351,6 +4779,77 @@ Ext.define('PVE.node.GpuManager', {
         ];
 
         me.callParent();
+
+        me.on('afterrender', function() { me.restoreAutoRefreshPreference(); });
+        me.on('activate', function() { me.restoreAutoRefreshPreference(); });
+        me.on('show', function() { me.restoreAutoRefreshPreference(); });
+        me.on('deactivate', function() { me.pauseAutoRefresh(); });
+        me.on('hide', function() { me.pauseAutoRefresh(); });
+        me.on('destroy', function() { me.pauseAutoRefresh(); });
+    },
+
+    setAutoRefreshPreference: function(enabled) {
+        var me = this;
+        enabled = !!enabled;
+        me.autoRefreshPreferred = enabled;
+        Ext.state.Manager.getProvider().set(me.autoRefreshStateKey, enabled);
+        me.down('#deviceGrid').setAutoRefreshEnabled(enabled, true);
+        if (enabled) {
+            me.startAutoRefresh();
+        } else {
+            me.pauseAutoRefresh();
+        }
+    },
+
+    restoreAutoRefreshPreference: function() {
+        var me = this;
+        var saved = Ext.state.Manager.getProvider().get(me.autoRefreshStateKey);
+        me.autoRefreshPreferred = saved === true || saved === 1 ||
+            saved === 'true' || saved === '1';
+        me.down('#deviceGrid').setAutoRefreshEnabled(me.autoRefreshPreferred, true);
+        if (me.autoRefreshPreferred) {
+            me.startAutoRefresh();
+        } else {
+            me.pauseAutoRefresh();
+        }
+    },
+
+    startAutoRefresh: function() {
+        var me = this;
+        if (!me.isVisible(true)) {
+            return;
+        }
+        if (me.autoRefreshEnabled) {
+            return;
+        }
+        me.autoRefreshEnabled = true;
+        me.runAutoRefresh();
+        me.autoRefreshTask = me.autoRefreshRunner.start({
+            run: function() { me.runAutoRefresh(); },
+            interval: 1000
+        });
+    },
+
+    pauseAutoRefresh: function() {
+        var me = this;
+        me.autoRefreshEnabled = false;
+        if (me.autoRefreshTask) {
+            me.autoRefreshRunner.stop(me.autoRefreshTask);
+            me.autoRefreshTask = null;
+        }
+    },
+
+    runAutoRefresh: function() {
+        var me = this;
+        if (!me.autoRefreshEnabled) {
+            return;
+        }
+        if (!me.isVisible(true)) {
+            me.pauseAutoRefresh();
+            return;
+        }
+        me.down('#deviceGrid').reload(undefined, true);
+        me.down('#deviceDetail').refreshLiveTelemetry();
     },
 
     openDevicePropertiesDialog: function(record) {
@@ -4387,6 +4886,21 @@ Ext.define('PVE.node.GpuManager', {
             deviceRecord: record
         });
         dlg.on('powerpolicychange', function(window, bdf) {
+            me.down('#deviceGrid').reload(bdf);
+        });
+        dlg.show();
+    },
+
+    openPowerLimitDialog: function(record) {
+        var me = this;
+        if (!record) {
+            return;
+        }
+        var dlg = Ext.create('PVE.window.GpuPowerLimitDialog', {
+            pveSelNode: me.pveSelNode,
+            deviceRecord: record
+        });
+        dlg.on('powerlimitchange', function(window, bdf) {
             me.down('#deviceGrid').reload(bdf);
         });
         dlg.show();

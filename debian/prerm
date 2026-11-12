@@ -18,6 +18,8 @@ disable_services() {
     systemctl disable pve-gpu-sriov.service 2>/dev/null || true
     systemctl stop pve-gpu-vfio.service 2>/dev/null || true
     systemctl disable pve-gpu-vfio.service 2>/dev/null || true
+    systemctl stop pve-gpu-power-limit.service 2>/dev/null || true
+    systemctl disable pve-gpu-power-limit.service 2>/dev/null || true
     log "Stopped and disabled PVE GPU Manager services"
 }
 

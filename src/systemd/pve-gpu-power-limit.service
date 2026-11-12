@@ -1,0 +1,17 @@
+[Unit]
+Description=Restore persisted Intel xe Card PL2 limits
+Requires=pve-cluster.service
+After=pve-cluster.service pve-gpu-sriov.service
+Before=pve-guests.service
+ConditionPathExists=/etc/pve/local/gpu-power-limit.conf
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/pve-gpu/apply-power-limit.sh
+RemainAfterExit=yes
+TimeoutStartSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

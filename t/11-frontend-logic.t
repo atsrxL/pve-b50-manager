@@ -28,8 +28,18 @@ like($vfio, qr/var\s+blocked\s*=\s*pfAssigned\s*\|\|/,
     'whole-PF assignment disables VFIO apply');
 
 my $device_grid = class_source('PVE.grid.GpuDeviceGrid');
-like($device_grid, qr/stateful:\s*true.*?stateId:\s*'grid-pve-gpu-devices-v1'/s,
+like($device_grid, qr/stateful:\s*true.*?stateId:\s*'grid-pve-gpu-devices-v3'/s,
     'device column widths use PVE browser-local grid state');
+like($device_grid, qr/header:\s*gettext\('Max VFs'\).*?hidden:\s*true.*?hideable:\s*true/s,
+    'Max VFs is hidden by default but remains selectable');
+like($device_grid, qr/header:\s*gettext\('VMs'\).*?hidden:\s*true.*?hideable:\s*true/s,
+    'VMs is hidden by default but remains selectable');
+like($device_grid, qr/header:\s*gettext\('Cur Freq'\).*?clock_mhz\s*===\s*null.*?clock_mhz\s*===\s*undefined/s,
+    'current-frequency rendering distinguishes a real zero from missing telemetry');
+like($device_grid, qr/header:\s*gettext\('Max Freq'\).*?hidden:\s*true.*?hideable:\s*true.*?clock_max_mhz\s*===\s*null.*?clock_max_mhz\s*===\s*undefined/s,
+    'maximum frequency is hidden by default but remains selectable');
+unlike($device_grid, qr/text\s*\+=.*?clock_max_mhz/s,
+    'current and maximum frequencies are never combined in one cell');
 like($device_grid, qr/var\s+driver\s*=\s*record\.get\('driver'\).*?gettext\('Live'\)/s,
     'VFIO cell labels the live driver from the driver field');
 like($device_grid, qr/gettext\('Boot VFIO'\).*val\s*\?\s*gettext\('Yes'\)/s,
@@ -50,6 +60,10 @@ like($device_grid, qr/itemId:\s*'atsPolicyBtn'.*?text:\s*gettext\('ATS Policy'\)
     'ATS policy is an on-demand button in the GPU Devices header');
 like($device_grid, qr/itemId:\s*'powerPolicyBtn'.*?text:\s*gettext\('Power Saving'\).*?fireEvent\('powerpolicyclick'/s,
     'B50 power saving is an on-demand button in the GPU Devices header');
+like($device_grid, qr/itemId:\s*'powerLimitBtn'.*?text:\s*gettext\('Power Limit'\).*?fireEvent\('powerlimitclick'/s,
+    'Card PL2 is an on-demand button in the GPU Devices header');
+like($device_grid, qr/powerLimitText\s*\+=.*?gettext\('Current'\).*?W \/.*?Card PL2/s,
+    'the Card PL2 button displays the selected device current limit');
 like($device_grid, qr/gpuTelemetrySleeping\(telemetry\).*?Telemetry is paused to avoid waking the GPU/s,
     'sleeping telemetry is rendered without pretending that live watts were sampled');
 like($device_grid, qr/vfio_configured.*?power_mode.*?Exit Power Saving before changing the PF driver.*?Sleeping/s,
@@ -58,8 +72,12 @@ like($device_grid, qr/var\s+powerActive\s*=.*?power_mode.*?atsPolicyBtn'\)\.setD
     'ATS policy access is disabled while the selected GPU is sleeping');
 like($device_grid, qr/dataIndex\s*===\s*'vfio_configured'\s*&&.*?power_mode.*?===\s*'normal'.*?fireEvent\('vfioclick'/s,
     'a sleeping device cannot open the PF-driver mutation dialog through its cell');
-like($device_grid, qr/header:\s*gettext\('LMEM \/ VRAM'\).*?lmem_total_mb.*?lmem_used_mb/s,
-    'the device grid identifies GPU-local memory as LMEM and VRAM');
+like($device_grid, qr/header:\s*gettext\('PF VRAM'\).*?lmem_total_mb.*?lmem_pf_resident_mb.*?lmem_allocator_used_mb/s,
+    'the device grid shows PF resident VRAM while retaining allocator usage only as diagnostics');
+like($device_grid, qr/itemId:\s*'autoRefreshBtn'.*?enableToggle:\s*true.*?fireEvent\(\s*'autorefreshchange'/s,
+    'the old refresh button is replaced by an explicit auto-refresh toggle');
+unlike($device_grid, qr/interval:\s*30000|refreshTask/,
+    'the device grid no longer owns a background polling timer');
 
 my $properties_dialog = class_source('PVE.window.GpuDevicePropertiesDialog');
 like($properties_dialog, qr/Device Properties: \{0\} \(\{1\}\).*?gpuPropertiesCard/s,
@@ -74,6 +92,22 @@ like($telemetry, qr/updateDisplay:\s*function\(telemetry\)\s*\{.*?me\.clearDispl
     'each telemetry render clears fields missing from the new response');
 like($telemetry, qr/memRange\.setText\('0\s+\\u2015\s+0'\)/,
     'clearing telemetry also clears the memory range label');
+like($telemetry, qr/lmem_pf_resident_mb.*?lmem_used_mb/s,
+    'the optional telemetry card prefers PF resident VRAM');
+unlike($telemetry, qr/Ext\.util\.TaskRunner|interval:\s*10000|refreshTask/,
+    'the optional telemetry card cannot create an independent hidden poller');
+
+my $power_limit = class_source('PVE.window.GpuPowerLimitDialog');
+like($power_limit, qr!/hardware/gpu/'\s*\+\s*encodeURIComponent\(bdf\)\s*\+\s*'/power-limit'.*?method:\s*'GET'!s,
+    'power-limit dialog loads the selected BDF Card PL2 status');
+like($power_limit, qr/gettext\('Current'\).*?gettext\('Card PL2'\).*?persistent_w/s,
+    'power-limit dialog shows current Card PL2 and boot persistence');
+like($power_limit, qr/background:#f7f7f7.*?color:#222.*?color:#555/s,
+    'power-limit summary uses explicit readable text colours on the light card');
+like($power_limit, qr/action:\s*'set'.*?watts:.*?persist:/s,
+    'Apply Now submits the live limit and explicit boot-persistence choice');
+like($power_limit, qr/remove the boot override.*?runAction\(\{\s*action:\s*'restore'\s*\}\)/s,
+    'Restore Original explicitly clears the boot override');
 
 my $ats = class_source('PVE.panel.GpuAtsPolicyPanel');
 like($ats, qr!/hardware/gpu/'\s*\+\s*encodeURIComponent\(bdf\)\s*\+\s*'/ats-policy'!,
@@ -132,6 +166,8 @@ like($prechecks, qr/if\s*\(check\.pass\)/,
     'precheck UI reads the backend pass field');
 like($prechecks, qr/check\.detail\s*\|\|\s*gettext\('Failed'\)/,
     'precheck failures display the backend detail');
+like($prechecks, qr/background:#f5f5f5;color:#2b2b2b.*?color:#2b2b2b !important.*?color:#555 !important/s,
+    'precheck cards keep readable text colours under the dark PVE theme');
 
 my $modify = class_source('PVE.window.ModifyVfsDialog');
 like($modify, qr/var\s+persistEnabled\s*=\s*status\.persisted_config\s*!==\s*undefined/s,
@@ -166,10 +202,22 @@ like($sriov, qr/assignmentPersistent:\s*assignmentPersistent/,
     'VF assignment policy is passed into the dialog');
 like($sriov, qr/itemId:\s*'vfGrid'.*?flex:\s*1.*?minHeight:\s*180/s,
     'the VF list keeps a visible minimum height while filling remaining space');
-like($sriov, qr/itemId:\s*'vfGrid'.*?stateful:\s*true.*?stateId:\s*'grid-pve-gpu-vfs-v1'/s,
+like($sriov, qr/itemId:\s*'vfGrid'.*?stateful:\s*true.*?stateId:\s*'grid-pve-gpu-vfs-v2'/s,
     'VF column widths use a separate PVE browser-local grid state');
 like($sriov, qr/header:\s*gettext\('LMEM'\).*?gpuVfResourceRenderer\('vram'\)/s,
     'per-VF local memory is labelled LMEM while retaining the backend VRAM resource key');
+like($sriov, qr/header:\s*gettext\('Live Engine Utilization'\).*?gpu_util_pct.*?render_util_pct.*?compute_util_pct.*?media_util_pct.*?copy_util_pct/s,
+    'VF GPU, Render, Compute, Media, and Copy counters share a second grouped header row');
+like($source, qr/function\s+gpuUtilisationRenderer.*?engine_util_source.*?windows-pdh-qga.*?Windows GPU Engine counters.*?busiest physical engine.*?xe-pmu-attribution-unavailable.*?actual per-VF engine utilization is unavailable/s,
+    'VF utilization identifies guest counters and refuses mislabeled GuC quanta');
+like($sriov, qr/vfReloadInFlight.*?refreshLiveTelemetry:\s*function\(\).*?reloadVfs\(\)/s,
+    'global refresh reuses one non-overlapping VF-list request');
+unlike($sriov, qr/itemId:\s*'schedulerStatus'|Device scheduler|Scheduler: loading/,
+    'the fixed low scheduler no longer occupies a visible status row');
+like($sriov, qr/header:\s*false/,
+    'the VF panel suppresses its redundant section header');
+unlike($sriov, qr/title:\s*gettext\('SR-IOV Virtual Functions'\)|setTitle\(gettext\('SR-IOV Virtual Functions'\)/,
+    'the VF panel never recreates the redundant SR-IOV Virtual Functions title');
 
 my $node_override = class_source('PVE.node.GpuManagerOverride');
 like($node_override, qr/var\s+gpuItem\s*=\s*\{.*?itemId:\s*'gpugpu'.*?me\.insertNodes\s*=\s*function\(items\).*?items\[i\]\.itemId\s*===\s*'summary'.*?items\.splice\(summaryIndex\s*\+\s*1,\s*0,\s*gpuItem\).*?baseInsertNodes\.call\(me,\s*items\).*?me\.callParent\(arguments\)/s,
@@ -219,8 +267,6 @@ like($sriov, qr/itemId:\s*'wholeGpuBtn'.*?Quick Whole-GPU Passthrough.*?openWhol
     'SR-IOV toolbar exposes the whole-GPU quick mode');
 like($sriov, qr/if\s*\(pfAssigned\).*?button\.setDisabled\(false\).*?currently assigned to VM \{0\}/s,
     'quick mode remains available and identifies an existing whole-GPU VM');
-like($sriov, qr/if\s*\(pfAssigned\).*?schedulerStatus.*?Unavailable while the PF is bound to vfio-pci/s,
-    'PF passthrough state replaces the stale scheduler loading message');
 like($sriov, qr/running\.length\s*>\s*0.*?button\.setDisabled\(true\).*?Stop every VF consumer VM/s,
     'running VF consumers disable quick mode');
 like($sriov, qr/var\s+atsUnsafe\s*=\s*atsKnown.*?affected.*?safe/s,
@@ -247,6 +293,8 @@ like($detail, qr/itemId:\s*'powerSleepNotice'.*?GPU is in power-saving mode.*?re
     'the parked VF workspace is replaced by a non-polling recovery notice');
 like($detail, qr/powerMode\s*!==\s*'normal'.*?return;.*?sriovPanel\.setVisible\(true\).*?atsPolicyProbe'\)\.loadDevice\(record\)/s,
     'normal mode restores the ordinary ATS and VF workspace loads');
+like($detail, qr/sameWorkspace.*?sriovPanel\.deviceRecord\s*=\s*record.*?return/s,
+    'one-second telemetry record replacement does not reload ATS and full SR-IOV state');
 
 my $ats_dialog = class_source('PVE.window.GpuAtsPolicyDialog');
 like($ats_dialog, qr/ATS Safety Policy: \{0\}.*?gpuAtsPolicyPanel.*?loadDevice\(record\)/s,
@@ -259,10 +307,24 @@ like($manager, qr/vfschanged:\s*function\(detail,\s*bdf\).*?deviceGrid'\)\.reloa
     'whole-GPU completion reloads the changed BDF in the device grid');
 like($manager, qr/itemId:\s*'deviceGrid'.*?height:\s*166.*?split:\s*false/s,
     'the GPU device area is fixed to the reviewed two-row height');
-like($manager, qr/deviceinfoclick:.*?openDevicePropertiesDialog.*?powerpolicyclick:.*?openPowerPolicyDialog.*?atspolicyclick:.*?openAtsPolicyDialog/s,
-    'the manager routes properties, power, and ATS dialogs from the compact device grid');
+like($manager, qr/deviceinfoclick:.*?openDevicePropertiesDialog.*?powerpolicyclick:.*?openPowerPolicyDialog.*?powerlimitclick:.*?openPowerLimitDialog.*?atspolicyclick:.*?openAtsPolicyDialog/s,
+    'the manager routes properties, Card PL2, power saving, and ATS dialogs from the compact device grid');
 like($manager, qr/powerpolicychange.*?deviceGrid'\)\.reload\(bdf\)/s,
     'a completed power transition refreshes only the selected BDF');
+like($manager, qr/interval:\s*1000.*?deviceGrid'\)\.reload\(undefined,\s*true\).*?refreshLiveTelemetry\(\)/s,
+    'the global toggle refreshes device and VF telemetry once per second');
+like($manager, qr/autoRefreshStateKey:\s*'pve-gpu-auto-refresh-v1'|autoRefreshStateKey\s*=\s*'pve-gpu-auto-refresh-v1'/,
+    'auto-refresh uses a stable browser-local preference key');
+like($manager, qr/setAutoRefreshPreference:.*?getProvider\(\)\.set\(me\.autoRefreshStateKey,\s*enabled\)/s,
+    'explicit auto-refresh toggles update the browser-local preference');
+like($manager, qr/restoreAutoRefreshPreference:.*?getProvider\(\)\.get\(me\.autoRefreshStateKey\).*?setAutoRefreshEnabled\(me\.autoRefreshPreferred,\s*true\)/s,
+    'each page entry restores the toggle from browser-local state');
+like($manager, qr/afterrender.*?restoreAutoRefreshPreference.*?activate.*?restoreAutoRefreshPreference.*?show.*?restoreAutoRefreshPreference/s,
+    'rendering or returning to the GPU page reapplies the cached preference');
+like($manager, qr/deactivate.*?pauseAutoRefresh\(\).*?hide.*?pauseAutoRefresh\(\).*?destroy.*?pauseAutoRefresh\(\)/s,
+    'leaving or destroying the GPU page pauses its poller without clearing preference');
+unlike($manager, qr/pauseAutoRefresh:.*?getProvider\(\)\.set|pauseAutoRefresh:.*?setAutoRefreshEnabled\(false/s,
+    'pausing a hidden page does not overwrite its cached toggle');
 
 my $node;
 for my $dir (split(/:/, $ENV{PATH} // '')) {

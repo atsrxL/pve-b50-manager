@@ -183,7 +183,10 @@ mkfile "$PF1/hwmon/hwmon1/temp1_input"  "43000"
 mkfile "$PF1/hwmon/hwmon1/temp2_label"  "Memory"
 mkfile "$PF1/hwmon/hwmon1/temp2_input"  "55000"
 mkfile "$PF1/hwmon/hwmon1/power1_input" "48000000"
+mkfile "$PF1/hwmon/hwmon1/name"         "xe"
+mkfile "$PF1/hwmon/hwmon1/power1_cap"   "60000000"
 mkfile "$PF1/tile0/gt0/freq0/act_freq"  "2100"
+mkfile "$PF1/tile0/gt0/freq0/cur_freq"  "1800"
 mkfile "$PF1/tile0/gt0/freq0/max_freq"  "2400"
 
 # Current xe SR-IOV debugfs layout for BMG.
@@ -240,6 +243,18 @@ cat > "$DBG/vram0_mm" << 'VRAMEOF'
 default_page_size: 4KiB
 VRAMEOF
 chmod 666 "$DBG/vram0_mm"
+
+# PF resident VRAM uses the same DRM fdinfo accounting as nvtop.  Duplicate
+# FDs for one client must not be counted twice by the plugin.
+mkdir -p "$ROOT/proc/4242/fdinfo"
+for fd in 3 4; do
+    cat > "$ROOT/proc/4242/fdinfo/$fd" << 'FDINFOEOF'
+drm-driver: xe
+drm-client-id: 17
+drm-pdev: 0000:04:00.0
+drm-resident-vram0: 1048576 KiB
+FDINFOEOF
+done
 
 # ---------------------------------------------------------------------------
 # Summary

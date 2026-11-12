@@ -458,7 +458,7 @@ ok(-x $patch_script, 'marker patch script is executable');
     my $patched_hardware = slurp($hardware);
     is(occurrences($patched_index, '<!-- BEGIN PVE GPU MANAGER -->'), 1,
         'index contains one owned marker block');
-    is(occurrences($patched_index, '<script src="/pve2/js/pve-gpu-plugin.js?ver=1.1.0-12"></script>'), 1,
+    is(occurrences($patched_index, '<script src="/pve2/js/pve-gpu-plugin.js?ver=1.1.0-20"></script>'), 1,
         'index contains one versioned plugin script tag');
     is(occurrences($patched_hardware, '# BEGIN PVE GPU MANAGER HARDWARE '), 3,
         'Hardware.pm contains three owned marker blocks');
@@ -512,7 +512,7 @@ OLD_BLOCKS
         'upgrade leaves exactly one GPU plugin script tag');
     is(occurrences($patched_index, '<!-- BEGIN PVE GPU MANAGER -->'), 1,
         'upgrade leaves exactly one owned index marker block');
-    like($patched_index, qr/pve-gpu-plugin[.]js[?]ver=1[.]1[.]0-12/,
+    like($patched_index, qr/pve-gpu-plugin[.]js[?]ver=1[.]1[.]0-20/,
         'upgrade installs only the current cache version');
     unlike($patched_index, qr/pve-gpu-plugin[.]js[?]ver=1[.]1[.]0-(?:7|8|9|10)/,
         'upgrade removes every stale versioned plugin reference');
@@ -561,7 +561,7 @@ OLD_BLOCKS
     write_file($nodes, "package PVE::API2::Nodes;\n1;\n");
 
     ok(run_patch_script($index, $hardware, $nodes, '--apply'), 'legacy unmarked install migrates to markers');
-    is(occurrences(slurp($index), '<script src="/pve2/js/pve-gpu-plugin.js?ver=1.1.0-12"></script>'), 1,
+    is(occurrences(slurp($index), '<script src="/pve2/js/pve-gpu-plugin.js?ver=1.1.0-20"></script>'), 1,
         'legacy index tag is replaced by one versioned tag');
     is(occurrences(slurp($index), '<script src="/pve2/js/pve-gpu-plugin.js"></script>'), 0,
         'legacy unversioned script tag is removed');
@@ -582,11 +582,13 @@ OLD_BLOCKS
         'src/js/pve-gpu-plugin.js',
         'src/scripts/apply-sriov-config.sh',
         'src/scripts/apply-vfio-config.sh',
+        'src/scripts/apply-power-limit.sh',
         'src/scripts/manage-ats-policy.sh',
         'src/scripts/check-pve-gpu-binders.sh',
         'src/scripts/reapply-patches.sh',
         'src/systemd/pve-gpu-sriov.service',
         'src/systemd/pve-gpu-vfio.service',
+        'src/systemd/pve-gpu-power-limit.service',
         'src/systemd/pve-guests.service.d/10-pve-gpu-manager.conf',
         'config/99-pve-gpu-reapply',
     ) {
@@ -630,6 +632,8 @@ OLD_BLOCKS
         'postinst enables the guarded VFIO service');
     like($postinst, qr/systemctl enable pve-gpu-sriov\.service/,
         'postinst enables the boot-time SR-IOV restore service');
+    like($postinst, qr/systemctl enable pve-gpu-power-limit\.service/,
+        'postinst enables the boot-time Card PL2 restore service');
     unlike($postinst, qr/systemctl start pve-gpu-(?:sriov|vfio)\.service/,
         'install and upgrade never mutate live PCI topology by starting services');
     like($postinst, qr/triggered\).*?--apply --force-restart/s,
@@ -641,7 +645,11 @@ OLD_BLOCKS
         qr/--check-native/,
         'native ATS health gate has a read-only check action');
 
-    for my $service (qw(pve-gpu-vfio.service pve-gpu-sriov.service)) {
+    for my $service (qw(
+        pve-gpu-vfio.service
+        pve-gpu-sriov.service
+        pve-gpu-power-limit.service
+    )) {
         my $unit = slurp(File::Spec->catfile($root, 'src', 'systemd', $service));
         like($unit, qr/Before=.*pve-guests\.service/s,
             "$service is ordered before pve-guests");
@@ -654,6 +662,10 @@ OLD_BLOCKS
         'pve-guests starts both persisted PCI binders in its transaction');
     like($pve_guests_dropin, qr/After=.*pve-gpu-vfio\.service.*pve-gpu-sriov\.service/s,
         'pve-guests starts only after both persisted PCI binders');
+    like($pve_guests_dropin, qr/Wants=.*pve-gpu-power-limit\.service/s,
+        'pve-guests pulls Card PL2 restoration into the boot transaction');
+    like($pve_guests_dropin, qr/After=.*pve-gpu-power-limit\.service/s,
+        'guest workloads start after the Card PL2 restore attempt');
     like($pve_guests_dropin, qr/ExecStartPre=.*reapply-patches\.sh --check-native/,
         'every pve-guests start performs an independent native ATS health check');
     like($pve_guests_dropin, qr/ExecStartPre=.*check-pve-gpu-binders\.sh/,
@@ -687,6 +699,8 @@ OLD_BLOCKS
         'purge removes generated SR-IOV configuration');
     like($postrm, qr/purge\).*?rm -f "\$POWER_STATE"/s,
         'purge removes stale runtime power state after guarded removal');
+    like($postrm, qr/purge\).*?rm -f "\$POWER_LIMIT_CONF"/s,
+        'purge removes generated Card PL2 persistence');
     like($postrm, qr/purge\).*?vfio-pci\\?\.ids=.*?update-grub/s,
         'purge also removes a package-owned legacy vfio-pci.ids argument');
 

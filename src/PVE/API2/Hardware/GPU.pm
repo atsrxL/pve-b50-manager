@@ -5,13 +5,16 @@ use warnings;
 use PVE::RESTHandler;
 use PVE::JSONSchema qw(get_standard_option);
 use base qw(PVE::RESTHandler);
-use Fcntl qw(O_WRONLY O_RDONLY O_TRUNC :flock);
+use Fcntl qw(O_CREAT O_EXCL O_RDWR O_WRONLY O_RDONLY O_TRUNC :flock);
 use File::Basename;
 use File::Glob ':bsd_glob';
+use File::Path qw(make_path);
+use JSON::PP qw(decode_json encode_json);
 use Storable qw(dclone);
-use Time::HiRes qw(usleep);
+use Time::HiRes qw(time usleep);
 use PVE::Tools qw(run_command file_get_contents file_set_contents);
 use PVE::QemuConfig;
+use PVE::QemuServer::Agent ();
 use PVE::QemuServer::Helpers;
 use PVE::QemuServer::Machine;
 use PVE::QemuServer::PCI;
@@ -60,6 +63,8 @@ my $BDF_RE = '[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]';
 # Config paths
 my $GPU_SRIOV_CONF      = $ENV{PVE_GPU_SRIOV_CONF}
     // '/etc/pve/local/gpu-sriov.conf';
+my $GPU_POWER_LIMIT_CONF = $ENV{PVE_GPU_POWER_LIMIT_CONF}
+    // '/etc/pve/local/gpu-power-limit.conf';
 my $QEMU_CONF_DIR       = $ENV{PVE_GPU_QEMU_CONF_DIR}
     // '/etc/pve/qemu-server';
 my $PCI_RESERVATION_LOCK = $ENV{PVE_GPU_PCI_RESERVATION_LOCK}
@@ -359,6 +364,168 @@ sub write_ini_config {
         die $error;
     }
     return 1;
+}
+
+sub _valid_power_watts {
+    my ($value) = @_;
+    return defined($value) && $value =~ /^\d+(?:\.\d+)?$/ &&
+        $value >= 1 && $value <= 300;
+}
+
+sub _power_limit_status_for_record {
+    my ($rec) = @_;
+    my $plugin = get_vendor_plugin($rec->{vendor_id});
+    my $status = {
+        supported => \0,
+        writable => \0,
+        limit_name => 'Card PL2',
+        current_w => undef,
+        original_w => undef,
+        persistent => \0,
+        persistent_w => undef,
+    };
+
+    if (($rec->{power_mode} // 'normal') ne 'normal') {
+        $status->{reason} = 'Exit Power Saving before reading or changing Card PL2';
+        return $status;
+    }
+    if (($rec->{driver} // '') ne 'xe') {
+        $status->{reason} = 'Card PL2 is available only while the PF uses the xe driver';
+        return $status;
+    }
+    if (!$plugin || !$plugin->can('read_power_limit')) {
+        $status->{reason} = 'This GPU backend does not expose Card PL2';
+        return $status;
+    }
+
+    my $live = eval { $plugin->read_power_limit($rec->{drm_card}) };
+    if ($@ || ref($live) ne 'HASH') {
+        $status->{reason} = $@ || 'Cannot read the xe Card PL2 control';
+        $status->{reason} =~ s/\s+\z//;
+        return $status;
+    }
+    delete($live->{sysfs_path});
+    $status = { %$status, %$live };
+
+    my $config;
+    my $config_ok = eval {
+        $config = parse_ini_config($GPU_POWER_LIMIT_CONF, 1);
+        1;
+    };
+    if (!$config_ok) {
+        $status->{config_error} = $@ || 'Cannot read the power-limit configuration';
+        $status->{config_error} =~ s/\s+\z//;
+        return $status;
+    }
+    my $section = $config->{$rec->{bdf}};
+    if (ref($section) eq 'HASH') {
+        if (_valid_power_watts($section->{original_w})) {
+            $status->{original_w} = 0 + $section->{original_w};
+            $status->{original_source} = 'captured';
+        }
+        my $persist = $section->{persist} // '0';
+        if ($persist !~ /^(?:0|1)$/) {
+            $status->{config_error} = 'Invalid persist value in the Card PL2 configuration';
+        } elsif ($persist eq '1') {
+            if (_valid_power_watts($section->{persistent_w})) {
+                $status->{persistent} = \1;
+                $status->{persistent_w} = 0 + $section->{persistent_w};
+            } else {
+                $status->{config_error} = 'Invalid persistent_w value in the Card PL2 configuration';
+            }
+        }
+    }
+
+    if (!defined($status->{original_w}) &&
+        $plugin->can('default_card_pl2_w')) {
+        my $default = $plugin->default_card_pl2_w($rec->{device_id});
+        if (_valid_power_watts($default)) {
+            $status->{original_w} = 0 + $default;
+            $status->{original_source} = 'device-profile';
+        }
+    }
+    if (!defined($status->{original_w}) &&
+        _valid_power_watts($status->{current_w})) {
+        $status->{original_w} = 0 + $status->{current_w};
+        $status->{original_source} = 'first-observed';
+    }
+
+    return $status;
+}
+
+sub _power_limit_status {
+    my ($bdf) = @_;
+    _assert_power_mode_normal($bdf, 'read the Card PL2 power limit');
+    my $rec = _collect_device($bdf, 0);
+    die "Device '$bdf' not found or not a supported GPU\n" if !defined($rec);
+    return _power_limit_status_for_record($rec);
+}
+
+sub _change_power_limit {
+    my ($bdf, $action, $watts, $persist) = @_;
+    return _with_gpu_lock(sub {
+        _assert_power_mode_normal($bdf, 'change the Card PL2 power limit');
+        my $rec = _collect_device($bdf, 0);
+        die "Device '$bdf' not found or not a supported GPU\n" if !defined($rec);
+        die "Card PL2 can be changed only while $bdf uses the xe driver\n"
+            if ($rec->{driver} // '') ne 'xe';
+        my $plugin = get_vendor_plugin($rec->{vendor_id});
+        die "This GPU backend does not support Card PL2 writes\n"
+            if !$plugin || !$plugin->can('write_power_limit');
+
+        my $before = _power_limit_status_for_record($rec);
+        die(($before->{reason} // 'Card PL2 is unavailable') . "\n")
+            if !_bool_value($before->{supported});
+        die "Card PL2 is read-only\n" if !_bool_value($before->{writable});
+        die "Cannot change Card PL2 while its persistent configuration is invalid: " .
+            "$before->{config_error}\n" if defined($before->{config_error});
+
+        my $config = parse_ini_config($GPU_POWER_LIMIT_CONF, 1);
+        my $target;
+        if ($action eq 'restore') {
+            $target = $before->{original_w};
+            die "No original Card PL2 value is available for $bdf\n"
+                if !_valid_power_watts($target);
+        } else {
+            die "Power limit must be between 1 and 300 watts\n"
+                if !_valid_power_watts($watts);
+            $target = 0 + $watts;
+        }
+
+        my $original = $before->{original_w};
+        $original = $before->{current_w} if !_valid_power_watts($original);
+        die "Cannot capture the original Card PL2 value for $bdf\n"
+            if !_valid_power_watts($original);
+        my $live_before = $before->{current_w};
+
+        $plugin->write_power_limit($rec->{drm_card}, $target);
+        my $config_ok = eval {
+            if ($action eq 'restore') {
+                delete($config->{$bdf});
+            } else {
+                $config->{$bdf} = {
+                    api_version => 1,
+                    device_id => $rec->{device_id},
+                    original_w => 0 + $original,
+                    persist => $persist ? 1 : 0,
+                };
+                $config->{$bdf}{persistent_w} = 0 + $target if $persist;
+            }
+            write_ini_config($GPU_POWER_LIMIT_CONF, $config);
+            1;
+        };
+        if (!$config_ok) {
+            my $error = $@ || 'unknown Card PL2 persistence failure';
+            my $rollback_error;
+            eval { $plugin->write_power_limit($rec->{drm_card}, $live_before) };
+            $rollback_error = $@ if $@;
+            $error .= "Live Card PL2 rollback also failed: $rollback_error"
+                if defined($rollback_error);
+            die $error;
+        }
+
+        return _power_limit_status_for_record($rec);
+    });
 }
 
 sub _persistent_device_enabled {
@@ -734,8 +901,10 @@ sub _collect_device {
     $record->{pf_vmid} = $pf_vm;
 
     # Get VMs assigned to this GPU's VFs
+    my $assigned_consumers = [];
     if (int($sriov_numvfs) > 0 && defined $card) {
         my $assigned = check_vf_vm_assignments($bdf, $card, int($sriov_numvfs));
+        $assigned_consumers = $assigned;
         my %seen;
         # Include PF VM if assigned
         $seen{$pf_vm} = 1 if defined $pf_vm;
@@ -761,8 +930,29 @@ sub _collect_device {
         $record->{firmware_version} = '';
     }
 
-    if ($with_telemetry && defined $card) {
-        $record->{telemetry} = $plugin->read_telemetry($card, $bdf, $driver);
+    if ($with_telemetry) {
+        $record->{telemetry} = $plugin->read_telemetry($card, $bdf, $driver)
+            if defined($card);
+        my @running_vfs = grep {
+            ($_->{vf_index} // 0) > 0 && $_->{running}
+        } @$assigned_consumers;
+        if (@running_vfs) {
+            my $guest_metrics = _guest_engine_metrics_by_vf($assigned_consumers);
+            if (@running_vfs == 1 &&
+                ref($guest_metrics->{$running_vfs[0]{vf_index}}) eq 'HASH') {
+                $record->{telemetry}{gpu_util_pct} =
+                    $guest_metrics->{$running_vfs[0]{vf_index}}{gpu_util_pct};
+                $record->{telemetry}{engine_util_source} = 'windows-pdh-qga';
+            } else {
+                # Xe's per-function active/total ticks represent GuC engine
+                # scheduling quanta.  When VF work is attributed to function
+                # zero they are not an actual device utilization percentage.
+                delete $record->{telemetry}{gpu_util_pct};
+                $record->{telemetry}{engine_util_source} =
+                    'xe-pmu-attribution-unavailable';
+            }
+        }
+        $record->{power_limit} = _power_limit_status_for_record($record);
     }
 
     return $record;
@@ -1958,10 +2148,325 @@ sub _profiles_require_auto_reprovision {
     return 0;
 }
 
+my $WINDOWS_GPU_COUNTER_SCRIPT = <<'POWERSHELL';
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
+$payload = [ordered]@{
+    adapters = @(
+        Get-CimInstance -ClassName Win32_PerfFormattedData_GPUPerformanceCounters_GPUAdapterMemory |
+            ForEach-Object {
+                [ordered]@{
+                    name = [string]$_.Name
+                    dedicated = [uint64]$_.DedicatedUsage
+                    shared = [uint64]$_.SharedUsage
+                    committed = [uint64]$_.TotalCommitted
+                }
+            }
+    )
+    engines = @(
+        Get-CimInstance -ClassName Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine |
+            Where-Object { $_.UtilizationPercentage -gt 0 } |
+            ForEach-Object {
+                [ordered]@{
+                    name = [string]$_.Name
+                    value = [double]$_.UtilizationPercentage
+                }
+            }
+    )
+}
+$payload | ConvertTo-Json -Compress -Depth 4
+POWERSHELL
+
+sub _guest_counter_number {
+    my ($value) = @_;
+    return undef if !defined($value) || ref($value);
+    return undef if "$value" !~ /^\d+(?:\.\d+)?$/;
+    return 0 + $value;
+}
+
+sub _parse_windows_engine_instance_name {
+    my ($name) = @_;
+    return if !defined($name) || ref($name);
+    my ($adapter, $engine, $type) = "$name" =~
+        /^pid_\d+_(luid_0x[0-9a-f]+_0x[0-9a-f]+_phys_\d+)_eng_(\d+)_engtype_(.*)$/i;
+    return if !defined($adapter);
+    return (lc($adapter), int($engine), $type // '');
+}
+
+# Windows exposes the same per-process GPU Engine counters used by Task
+# Manager and Intel Graphics Software.  Sum processes sharing one physical
+# engine, then report the busiest engine for the overall GPU and each engine
+# group.  This avoids adding percentages from independent engines.
+sub _parse_windows_guest_engine_telemetry {
+    my ($text) = @_;
+    return undef if !defined($text) || ref($text) || $text eq '';
+    $text =~ s/^\xEF\xBB\xBF//;
+    my $payload = eval { decode_json($text) };
+    return undef if ref($payload) ne 'HASH';
+
+    my @parsed_engines;
+    my %activity_by_adapter;
+    for my $entry (@{$payload->{engines} // []}) {
+        next if ref($entry) ne 'HASH';
+        my $value = _guest_counter_number($entry->{value});
+        next if !defined($value) || $value < 0;
+        my ($adapter, $engine, $type) =
+            _parse_windows_engine_instance_name($entry->{name});
+        next if !defined($adapter);
+        push @parsed_engines, {
+            adapter => $adapter,
+            engine => $engine,
+            type => $type,
+            value => $value,
+        };
+        $activity_by_adapter{$adapter} += $value;
+    }
+
+    # The passed-through B50 is the adapter with real dedicated residency.
+    # This excludes virtual display adapters which expose the same counter
+    # classes but have zero dedicated memory.
+    my ($target_adapter, $best_resident, $best_committed);
+    for my $adapter (@{$payload->{adapters} // []}) {
+        next if ref($adapter) ne 'HASH';
+        my $name = lc($adapter->{name} // '');
+        next if $name !~ /^luid_0x[0-9a-f]+_0x[0-9a-f]+_phys_\d+$/;
+        my $dedicated = _guest_counter_number($adapter->{dedicated}) // 0;
+        my $shared = _guest_counter_number($adapter->{shared}) // 0;
+        my $committed = _guest_counter_number($adapter->{committed}) // 0;
+        my $resident = $dedicated + $shared;
+        if (!defined($target_adapter) ||
+            $resident > $best_resident ||
+            ($resident == $best_resident && $committed > $best_committed)) {
+            $target_adapter = $name;
+            $best_resident = $resident;
+            $best_committed = $committed;
+        }
+    }
+    if (!defined($target_adapter) && %activity_by_adapter) {
+        ($target_adapter) = sort {
+            $activity_by_adapter{$b} <=> $activity_by_adapter{$a}
+        } keys %activity_by_adapter;
+    }
+    return undef if !defined($target_adapter);
+
+    my (%engine_totals, %engine_types);
+    for my $entry (@parsed_engines) {
+        next if $entry->{adapter} ne $target_adapter;
+        my $key = join('|', $entry->{engine}, lc($entry->{type}));
+        $engine_totals{$key} += $entry->{value};
+        $engine_totals{$key} = 100 if $engine_totals{$key} > 100;
+        $engine_types{$key} = $entry->{type};
+    }
+
+    my %maximum = map { $_ => 0 } qw(gpu render compute media copy);
+    for my $key (keys %engine_totals) {
+        my $value = $engine_totals{$key};
+        $maximum{gpu} = $value if $value > $maximum{gpu};
+        my $type = lc($engine_types{$key} // '');
+        my $group = $type =~ /^(?:3d|render|graphics)$/ ? 'render'
+            : $type eq 'compute' ? 'compute'
+            : $type eq 'copy' ? 'copy'
+            : $type =~ /(?:video|media|codec|decode|encode|processing|enhance)/ ? 'media'
+            : undef;
+        $maximum{$group} = $value
+            if defined($group) && $value > $maximum{$group};
+    }
+
+    my %result;
+    for my $group (qw(gpu render compute media copy)) {
+        $result{"${group}_util_pct"} =
+            0 + sprintf('%.1f', $maximum{$group});
+    }
+    $result{adapter_name} = $target_adapter;
+    return \%result;
+}
+
+sub _guest_engine_cache_path {
+    my ($vmid) = @_;
+    return if !defined($vmid) || "$vmid" !~ /^(\d{1,9})$/;
+    $vmid = int($1);
+    my $directory = $ENV{PVE_GPU_TELEMETRY_CACHE_DIR}
+        // sysfs_path('/run/pve-gpu/telemetry');
+    return ($directory, "$directory/windows-vm$vmid-engine.json");
+}
+
+sub _read_guest_engine_cache {
+    my ($path, $vmid) = @_;
+    return undef if !defined($path) || !open(my $fh, '<', $path);
+    local $/;
+    my $text = <$fh>;
+    close($fh);
+    my $payload = eval { decode_json($text) };
+    return undef if ref($payload) ne 'HASH' ||
+        ($payload->{vmid} // -1) != $vmid ||
+        !defined($payload->{sampled_at});
+    my $age = time() - $payload->{sampled_at};
+    my $ttl = $payload->{available} ? 1.0 : 5.0;
+    return undef if $age < 0 || $age >= $ttl;
+    return $payload;
+}
+
+sub _write_guest_engine_cache {
+    my ($directory, $path, $payload) = @_;
+    eval {
+        make_path($directory, { mode => 0755 }) if !-d $directory;
+        my $tmp = "$path.tmp.$$";
+        sysopen(my $fh, $tmp, O_WRONLY | O_CREAT | O_EXCL, 0644)
+            or die "Cannot create guest telemetry cache '$tmp': $!\n";
+        print {$fh} encode_json($payload)
+            or die "Cannot write guest telemetry cache '$tmp': $!\n";
+        close($fh) or die "Cannot close guest telemetry cache '$tmp': $!\n";
+        rename($tmp, $path)
+            or die "Cannot publish guest telemetry cache '$path': $!\n";
+        1;
+    };
+    return 1;
+}
+
+sub _lock_guest_engine_cache {
+    my ($directory, $path) = @_;
+    my $lock_fh;
+    my $locked = eval {
+        make_path($directory, { mode => 0755 }) if !-d $directory;
+        sysopen($lock_fh, "$path.lock", O_RDWR | O_CREAT, 0644)
+            or die "Cannot open guest telemetry lock '$path.lock': $!\n";
+        flock($lock_fh, LOCK_EX)
+            or die "Cannot lock guest telemetry cache '$path': $!\n";
+        1;
+    };
+    if (!$locked) {
+        close($lock_fh) if defined($lock_fh);
+        return undef;
+    }
+    return $lock_fh;
+}
+
+sub _sample_windows_guest_engine_telemetry {
+    my ($vmid) = @_;
+    return undef if !defined($vmid) || "$vmid" !~ /^(\d{1,9})$/;
+    $vmid = int($1);
+    my $conf = eval { PVE::QemuConfig->load_config($vmid) };
+    return undef if ref($conf) ne 'HASH' || ($conf->{ostype} // '') !~ /^win/i;
+
+    my @command = (
+        'powershell.exe',
+        '-NoLogo',
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        $WINDOWS_GPU_COUNTER_SCRIPT,
+    );
+    my ($status, $error);
+    {
+        local $SIG{ALRM} = sub { die "Windows guest GPU telemetry timed out\n" };
+        my $ok = eval {
+            alarm(3);
+            my $launch = PVE::QemuServer::Agent::qemu_exec(
+                $vmid,
+                $conf,
+                undef,
+                \@command,
+            );
+            die "Windows guest GPU telemetry did not return a PID\n"
+                if ref($launch) ne 'HASH' || ($launch->{pid} // '') !~ /^\d+$/;
+            my $deadline = time() + 2.0;
+            while (time() < $deadline) {
+                my $candidate = PVE::QemuServer::Agent::qemu_exec_status(
+                    $vmid,
+                    $conf,
+                    int($launch->{pid}),
+                );
+                if (ref($candidate) eq 'HASH' && $candidate->{exited}) {
+                    $status = $candidate;
+                    last;
+                }
+                usleep(50_000);
+            }
+            die "Windows guest GPU telemetry command did not finish\n"
+                if ref($status) ne 'HASH';
+            alarm(0);
+            1;
+        };
+        $error = $@ if !$ok;
+        alarm(0);
+    }
+    return undef if $error || ref($status) ne 'HASH' ||
+        ($status->{exitcode} // 1) != 0 || $status->{'out-truncated'};
+    return _parse_windows_guest_engine_telemetry($status->{'out-data'});
+}
+
+sub _read_windows_guest_engine_telemetry {
+    my ($vmid) = @_;
+    my ($directory, $path) = _guest_engine_cache_path($vmid);
+    return undef if !defined($path);
+    my $cached = _read_guest_engine_cache($path, $vmid);
+    if (defined($cached)) {
+        return $cached->{available} && ref($cached->{metrics}) eq 'HASH'
+            ? $cached->{metrics}
+            : undef;
+    }
+
+    my $lock_fh = _lock_guest_engine_cache($directory, $path);
+    if (defined($lock_fh)) {
+        $cached = _read_guest_engine_cache($path, $vmid);
+        if (defined($cached)) {
+            close($lock_fh);
+            return $cached->{available} && ref($cached->{metrics}) eq 'HASH'
+                ? $cached->{metrics}
+                : undef;
+        }
+    }
+
+    my $metrics = eval { _sample_windows_guest_engine_telemetry($vmid) };
+    my $payload = {
+        vmid => int($vmid),
+        sampled_at => time(),
+        available => ref($metrics) eq 'HASH' ? 1 : 0,
+        metrics => ref($metrics) eq 'HASH' ? $metrics : undef,
+    };
+    _write_guest_engine_cache($directory, $path, $payload);
+    close($lock_fh) if defined($lock_fh);
+    return ref($metrics) eq 'HASH' ? $metrics : undef;
+}
+
+sub _guest_engine_metrics_by_vf {
+    my ($consumers) = @_;
+    my %vfs_by_vm;
+    for my $consumer (@{$consumers // []}) {
+        next if ref($consumer) ne 'HASH' || !$consumer->{running};
+        my $vf = $consumer->{vf_index} // 0;
+        my $vmid = $consumer->{vmid};
+        next if $vf < 1 || !defined($vmid);
+        $vfs_by_vm{$vmid}{$vf} = 1;
+    }
+
+    my %by_vf;
+    for my $vmid (keys %vfs_by_vm) {
+        my @vfs = keys %{$vfs_by_vm{$vmid}};
+        # Windows counters identify adapters by LUID rather than PCI BDF.  A
+        # VM with several VFs from this PF cannot be mapped unambiguously.
+        next if @vfs != 1;
+        my $metrics = _read_windows_guest_engine_telemetry($vmid);
+        $by_vf{$vfs[0]} = $metrics if ref($metrics) eq 'HASH';
+    }
+    return \%by_vf;
+}
+
 sub _vf_records {
-    my ($rec) = @_;
+    my ($rec, $with_telemetry) = @_;
     my $num_vfs = _read_sriov_numvfs($rec->{bdf});
     return [] if $num_vfs == 0;
+
+    my $engine_sample;
+    if ($with_telemetry && ($rec->{driver} // '') eq 'xe') {
+        my $plugin = get_vendor_plugin($rec->{vendor_id});
+        if ($plugin && $plugin->can('read_engine_telemetry')) {
+            $engine_sample = eval {
+                $plugin->read_engine_telemetry($rec->{bdf}, $num_vfs)
+            };
+        }
+    }
 
     my $persist_config = parse_ini_config($GPU_SRIOV_CONF);
     my $consumers = check_vf_vm_assignments(
@@ -1970,13 +2475,41 @@ sub _vf_records {
         $num_vfs,
     );
     my %consumer_by_vf = map { $_->{vf_index} => $_ } grep { $_->{vf_index} > 0 } @$consumers;
+    my @running_vfs = map { $_->{vf_index} }
+        grep { $_->{vf_index} > 0 && $_->{running} } @$consumers;
+    my $guest_metrics_by_vf = $with_telemetry
+        ? _guest_engine_metrics_by_vf($consumers)
+        : {};
+
+    # Current BMG GuC firmware attributes active VF ticks to function zero.
+    # Those counters describe allocated scheduling quanta, not the actual 3D,
+    # compute, media, or copy load visible to the guest.  Do not normalize them
+    # into a plausible-looking percentage.  A running Windows VM can replace
+    # them below with its real GPU Engine counters through QGA.
+    my $engine_attribution_missing;
+    if (ref($engine_sample) eq 'HASH' &&
+        ref($engine_sample->{active_ticks_by_function}) eq 'HASH') {
+        my $device_metrics = $engine_sample->{device} // $engine_sample->{pf};
+        my $host_pf_metrics = $engine_sample->{host_pf};
+        my $device_active = ref($device_metrics) eq 'HASH' &&
+            defined($device_metrics->{gpu_util_pct}) &&
+            $device_metrics->{gpu_util_pct} > 0;
+        my $host_pf_active = ref($host_pf_metrics) eq 'HASH' &&
+            defined($host_pf_metrics->{gpu_util_pct}) &&
+            $host_pf_metrics->{gpu_util_pct} > 0;
+        my $vf_active_ticks = 0;
+        $vf_active_ticks += $engine_sample->{active_ticks_by_function}{$_} // 0
+            for 1 .. $num_vfs;
+        $engine_attribution_missing = $device_active && !$host_pf_active &&
+            $vf_active_ticks == 0 && @running_vfs > 0;
+    }
     my @records;
 
     for my $vf (1 .. $num_vfs) {
         my $vf_bdf = _vf_bdf($rec->{bdf}, $vf) // '';
         my $resources = _read_vf_resources($rec, $vf, $persist_config);
         my $consumer = $consumer_by_vf{$vf};
-        push @records, {
+        my $record = {
             vf_index => $vf,
             bdf => $vf_bdf,
             driver => $vf_bdf ne '' ? _pci_driver($vf_bdf) : '',
@@ -1995,6 +2528,42 @@ sub _vf_records {
             exec_quantum_ms => $resources->{exec_quantum_ms}{effective},
             preempt_timeout_us => $resources->{preempt_timeout_us}{effective},
         };
+        if (ref($engine_sample) eq 'HASH' &&
+            ref($engine_sample->{vfs}) eq 'HASH' &&
+            ref($engine_sample->{vfs}{$vf}) eq 'HASH') {
+            $record->{$_} = $engine_sample->{vfs}{$vf}{$_}
+                for qw(
+                    gpu_util_pct
+                    render_util_pct
+                    compute_util_pct
+                    media_util_pct
+                    copy_util_pct
+                );
+            $record->{engine_util_source} = 'xe-pmu-function';
+        }
+        if ($engine_attribution_missing && $consumer && $consumer->{running}) {
+            $record->{$_} = undef
+                for qw(
+                    gpu_util_pct
+                    render_util_pct
+                    compute_util_pct
+                    media_util_pct
+                    copy_util_pct
+                );
+            $record->{engine_util_source} = 'xe-pmu-attribution-unavailable';
+        }
+        if (ref($guest_metrics_by_vf->{$vf}) eq 'HASH') {
+            $record->{$_} = $guest_metrics_by_vf->{$vf}{$_}
+                for qw(
+                    gpu_util_pct
+                    render_util_pct
+                    compute_util_pct
+                    media_util_pct
+                    copy_util_pct
+                );
+            $record->{engine_util_source} = 'windows-pdh-qga';
+        }
+        push @records, $record;
     }
     return \@records;
 }
@@ -3099,7 +3668,7 @@ __PACKAGE__->register_method({
         my $persist_config = parse_ini_config($GPU_SRIOV_CONF);
         my $persisted = $persist_config->{$bdf} // {};
         my $current_count = int($rec->{sriov_numvfs});
-        my $vfs = _vf_records($rec);
+        my $vfs = _vf_records($rec, 1);
         my $consumers = check_vf_vm_assignments(
             $bdf,
             $rec->{drm_card},
@@ -4594,7 +5163,7 @@ __PACKAGE__->register_method({
             my $rec = _collect_device($param->{bdf}, 0);
             die "Device '$param->{bdf}' not found or not a supported GPU\n"
                 if !defined($rec);
-            return _vf_records($rec);
+            return _vf_records($rec, 1);
         });
     },
 });
@@ -4635,7 +5204,7 @@ __PACKAGE__->register_method({
                 if !defined($rec);
 
         my $wanted = int($param->{vfIndex});
-        my $vfs = _vf_records($rec);
+        my $vfs = _vf_records($rec, 1);
         my ($vf) = grep { $_->{vf_index} == $wanted } @$vfs;
         die "VF index $wanted out of range (1.." . scalar(@$vfs) . ")\n"
             if !defined($vf);
@@ -4694,6 +5263,95 @@ __PACKAGE__->register_method({
             $param->{bdf},
             $param->{vfIndex},
             $param->{vmid},
+        );
+    },
+});
+
+__PACKAGE__->register_method({
+    name        => 'power_limit_status',
+    path        => '{bdf}/power-limit',
+    method      => 'GET',
+    description => 'Report the live xe Card PL2 limit, original value, and boot persistence.',
+    permissions => {
+        check => ['perm', '/nodes/{node}', ['Sys.Audit']],
+    },
+    protected => 1,
+    proxyto => 'node',
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => get_standard_option('pve-node'),
+            bdf => {
+                type => 'string',
+                description => 'PCI BDF address of the physical GPU',
+                pattern => $BDF_RE,
+            },
+        },
+    },
+    returns => { type => 'object' },
+    code => sub {
+        my ($param) = @_;
+        return _with_gpu_lock(sub {
+            return _power_limit_status($param->{bdf});
+        });
+    },
+});
+
+__PACKAGE__->register_method({
+    name        => 'change_power_limit',
+    path        => '{bdf}/power-limit',
+    method      => 'POST',
+    description => 'Set Card PL2 immediately or restore the original value, optionally persisting the override for boot.',
+    permissions => {
+        check => ['perm', '/nodes/{node}', ['Sys.Modify']],
+    },
+    protected => 1,
+    proxyto => 'node',
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => get_standard_option('pve-node'),
+            bdf => {
+                type => 'string',
+                description => 'PCI BDF address of the physical GPU',
+                pattern => $BDF_RE,
+            },
+            action => {
+                type => 'string',
+                enum => ['set', 'restore'],
+                description => 'Set a new Card PL2 value or restore the original value',
+            },
+            watts => {
+                type => 'number',
+                minimum => 1,
+                maximum => 300,
+                optional => 1,
+                description => 'New Card PL2 value in watts for action=set',
+            },
+            persist => {
+                type => 'boolean',
+                optional => 1,
+                default => 0,
+                description => 'Reapply this Card PL2 value during boot',
+            },
+        },
+    },
+    returns => { type => 'object' },
+    code => sub {
+        my ($param) = @_;
+        my $rpcenv = PVE::RPCEnvironment->get();
+        my $authuser = $rpcenv->get_user();
+        die "Only root\@pam may change the raw GPU Card PL2 limit\n"
+            if !defined($authuser) || $authuser ne 'root@pam';
+        die "watts is required when action=set\n"
+            if $param->{action} eq 'set' && !defined($param->{watts});
+        die "watts is valid only when action=set\n"
+            if $param->{action} eq 'restore' && defined($param->{watts});
+        return _change_power_limit(
+            $param->{bdf},
+            $param->{action},
+            $param->{watts},
+            $param->{persist} ? 1 : 0,
         );
     },
 });

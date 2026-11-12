@@ -8,6 +8,7 @@ TEMPLATE_CONF=${PVE_GPU_TEMPLATE_CONF:-/etc/pve/local/gpu-vf-templates.conf}
 LEGACY_MODPROBE_CONF=${PVE_GPU_LEGACY_MODPROBE_CONF:-/etc/modprobe.d/pve-gpu-vfio.conf}
 LEGACY_MODULES_CONF=${PVE_GPU_LEGACY_MODULES_CONF:-/etc/modules-load.d/pve-gpu-vfio.conf}
 VFIO_CONF=${PVE_GPU_VFIO_CONF:-/etc/pve-gpu-vfio.conf}
+POWER_LIMIT_CONF=${PVE_GPU_POWER_LIMIT_CONF:-/etc/pve/local/gpu-power-limit.conf}
 SYSFS_ROOT_CONF=${PVE_GPU_SYSFS_ROOT_CONF:-/etc/pve-gpu-sysfs-root}
 GRUB_DEFAULT=${PVE_GPU_GRUB_DEFAULT:-/etc/default/grub}
 INDEX_BACKUP=${PVE_GPU_INDEX_BACKUP:-/usr/share/pve-manager/index.html.tpl.pre-gpu}
@@ -49,6 +50,7 @@ case "$1" in
         rm -f "$LEGACY_MODPROBE_CONF"
         rm -f "$LEGACY_MODULES_CONF"
         rm -f "$VFIO_CONF"
+        rm -f "$POWER_LIMIT_CONF"
         rm -f "$SYSFS_ROOT_CONF"
         rm -f "$POWER_STATE"
 
