@@ -311,8 +311,8 @@ Ext.define('PVE.window.GpuVfioDialog', {
             success: function(response) {
                 var data = response.result && response.result.data;
                 me.setLoading(false);
-                me.close();
                 me.fireEvent('vfiochanged', me, bdf, data);
+                me.close();
             },
             failure: function(response, opts, error) {
                 me.setLoading(false);
@@ -2289,8 +2289,8 @@ Ext.define('PVE.window.ModifyVfsDialog', {
             params: params,
             success: function() {
                 me.setLoading(false);
-                me.close();
                 me.fireEvent('vfsmodified', me);
+                me.close();
             },
             failure: function(response, opts, error) {
                 me.setLoading(false);
@@ -4214,6 +4214,8 @@ Ext.define('PVE.panel.GpuSriovPanel', {
         me.sriovRequestId++;
         me.vfRequestId++;
         me.vfReloadInFlight = false;
+        me.sriovReloadInFlight = false;
+        me.sriovStatusUpdatedAt = 0;
 
         var vfGrid = me.down('#vfGrid');
         vfGrid.getStore().removeAll();
@@ -4247,24 +4249,47 @@ Ext.define('PVE.panel.GpuSriovPanel', {
         me.reloadVfs();
     },
 
-    reloadSriov: function() {
+    reloadSriov: function(onLoaded, background) {
         var me = this;
         var nodeName = me.pveSelNode && me.pveSelNode.data ? me.pveSelNode.data.node : undefined;
         var bdf = me.deviceRecord ? me.deviceRecord.get('bdf') : null;
-        if (!nodeName || !bdf) { return; }
+        if (!nodeName || !bdf) {
+            if (onLoaded) { onLoaded(gettext('No GPU selected.')); }
+            return;
+        }
         var requestId = ++me.sriovRequestId;
+        me.sriovReloadInFlight = true;
+        me.sriovStatusUpdatedAt = Date.now();
+        // Full status owns the VF snapshot until this request settles.
+        me.vfRequestId++;
+        me.vfReloadInFlight = false;
+        var fail = function(message) {
+            if (onLoaded) {
+                onLoaded(message);
+            } else if (!background && !me.destroyed) {
+                Ext.Msg.alert(gettext('Error'), message);
+            }
+        };
 
         Proxmox.Utils.API2Request({
             url: '/nodes/' + encodeURIComponent(nodeName) +
                  '/hardware/gpu/' + encodeURIComponent(bdf) + '/sriov',
             method: 'GET',
             success: function(response) {
-                if (requestId !== me.sriovRequestId || !me.isCurrentDevice(bdf)) {
+                if (me.destroyed || requestId !== me.sriovRequestId || !me.isCurrentDevice(bdf)) {
+                    if (onLoaded && !me.destroyed) {
+                        onLoaded(gettext('GPU status changed while loading. Please retry.'));
+                    }
                     return;
                 }
+                me.sriovReloadInFlight = false;
                 var data = response.result && response.result.data;
-                if (!data) { return; }
+                if (!data) {
+                    fail(gettext('Invalid or empty SR-IOV status response.'));
+                    return;
+                }
                 me.sriovStatus = data;
+                me.sriovStatusUpdatedAt = Date.now();
                 me.down('#precheckBar').loadPrechecks(data.prechecks);
 
                 // The v2 status response includes the same live VF records as
@@ -4295,12 +4320,17 @@ Ext.define('PVE.panel.GpuSriovPanel', {
 
                 me.updateModifyButton();
                 me.updateWholeGpuButton();
+                if (onLoaded) { onLoaded(); }
             },
             failure: function(response, opts, error) {
-                if (requestId !== me.sriovRequestId || !me.isCurrentDevice(bdf)) {
+                if (me.destroyed || requestId !== me.sriovRequestId || !me.isCurrentDevice(bdf)) {
+                    if (onLoaded && !me.destroyed) {
+                        onLoaded(gettext('GPU status changed while loading. Please retry.'));
+                    }
                     return;
                 }
-                Ext.Msg.alert(gettext('Error'), Ext.String.format(
+                me.sriovReloadInFlight = false;
+                fail(Ext.String.format(
                     gettext('Failed to load SR-IOV status: {0}'),
                     error || response.htmlStatus
                 ));
@@ -4312,7 +4342,7 @@ Ext.define('PVE.panel.GpuSriovPanel', {
         var me = this;
         var nodeName = me.pveSelNode && me.pveSelNode.data ? me.pveSelNode.data.node : undefined;
         var bdf = me.deviceRecord ? me.deviceRecord.get('bdf') : null;
-        if (!nodeName || !bdf || me.vfReloadInFlight) { return false; }
+        if (!nodeName || !bdf || me.vfReloadInFlight || me.sriovReloadInFlight) { return false; }
         var requestId = ++me.vfRequestId;
         me.vfReloadInFlight = true;
 
@@ -4355,6 +4385,13 @@ Ext.define('PVE.panel.GpuSriovPanel', {
         if (!record || !this.isVisible(true) ||
             (record.get('power_mode') || 'normal') !== 'normal') {
             return false;
+        }
+        // Resource/persistence changes need not change the VF count. Reconcile
+        // policy periodically without adding full discovery to every tick.
+        if (!this.sriovReloadInFlight &&
+            Date.now() - (this.sriovStatusUpdatedAt || 0) >= 15000) {
+            this.reloadSriov(null, true);
+            return true;
         }
         return this.reloadVfs();
     },
@@ -4525,6 +4562,30 @@ Ext.define('PVE.panel.GpuSriovPanel', {
     },
 
     openVfAssignmentDialog: function(vfRecord) {
+        var me = this;
+        if (me.assignmentLoading) { return; }
+        me.assignmentLoading = true;
+        me.setLoading(gettext('Loading current VF policy...'));
+        var vfIndex = vfRecord.get('vf_index');
+        var vfBdf = vfRecord.get('bdf');
+        me.reloadSriov(function(error) {
+            me.assignmentLoading = false;
+            if (me.destroyed) { return; }
+            me.setLoading(false);
+            if (error) {
+                Ext.Msg.alert(gettext('Error'), error);
+                return;
+            }
+            var current = me.down('#vfGrid').getStore().findRecord('vf_index', vfIndex, 0, false, true, true);
+            if (!current || current.get('bdf') !== vfBdf) {
+                Ext.Msg.alert(gettext('Unavailable'), gettext('The VF topology changed. Select the VF again.'));
+                return;
+            }
+            me.showVfAssignmentDialog(current);
+        });
+    },
+
+    showVfAssignmentDialog: function(vfRecord) {
         var me = this;
         var status = me.sriovStatus;
         var caps = status && status.capabilities;

@@ -18,7 +18,8 @@ SYSTEMD_RUNTIME_DIR="${PVE_GPU_SYSTEMD_RUNTIME_DIR:-/run/systemd/system}"
 
 INDEX_BEGIN='<!-- BEGIN PVE GPU MANAGER -->'
 INDEX_END='<!-- END PVE GPU MANAGER -->'
-SCRIPT_TAG='<script src="/pve2/js/pve-gpu-plugin.js?ver=1.1.0-20"></script>'
+PLUGIN_JS="${PVE_GPU_PLUGIN_JS:-/usr/share/pve-manager/js/pve-gpu-plugin.js}"
+SCRIPT_TAG=''
 
 ATS_PCI_USE_BEGIN='# BEGIN PVE GPU MANAGER ATS PCI USE'
 ATS_PCI_USE_END='# END PVE GPU MANAGER ATS PCI USE'
@@ -708,6 +709,9 @@ done
 
 case "$ACTION" in
     --apply)
+        plugin_hash=$(sha256sum "$PLUGIN_JS") || die "Cannot hash plugin asset $PLUGIN_JS"
+        plugin_hash=${plugin_hash%% *}
+        SCRIPT_TAG="<script src=\"/pve2/js/pve-gpu-plugin.js?ver=$plugin_hash\"></script>"
         apply_all
         ;;
     --remove)

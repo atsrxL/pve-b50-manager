@@ -1,7 +1,7 @@
 DESTDIR ?=
 PREFIX  ?= /usr
 
-.PHONY: build install deb test e2e-test clean
+.PHONY: build install deb test frontend-test e2e-test clean
 
 build:
 	@echo "Nothing to build (pure Perl/JS plugin)"
@@ -52,6 +52,14 @@ deb:
 
 test:
 	prove -r t/
+
+# Explicit opt-in: PVE ExtJS assets are not bundled in the source checkout.
+frontend-test:
+	@if [ -z "$$GPU_EXTJS_PATH" ]; then \
+		echo "SKIP frontend-test: set GPU_EXTJS_PATH to PVE ext-all-debug.js"; \
+	else \
+		node test/frontend-state.cjs; \
+	fi
 
 e2e-test:
 	cd test/e2e && npx playwright test

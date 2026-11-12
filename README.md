@@ -279,8 +279,31 @@ reconciliation, conflict handling, and rollback when PVE libraries are
 available.
 
 t/10-sriov-boot-rollback.t covers multi-PF rollback, legacy-profile migration,
-and PF/VF scheduler consistency under Bash 4 or newer. t/11-frontend-logic.t
-covers request ownership and the live-versus-persisted UI state.
+and PF/VF scheduler consistency under Bash 4 or newer.
+`test/frontend-state.cjs` uses real ExtJS window lifecycles to cover saved-profile
+refresh, drift reconciliation, fresh assignment eligibility, failed reads and
+topology changes. Run on the build worker with Playwright installed and the
+ExtJS theme CSS imports combined into one file:
+
+~~~bash
+GPU_EXTJS_PATH=/path/to/ext-all-debug.js \
+GPU_EXTJS_CSS_PATH=/path/to/combined-theme.css \
+BROWSER_PATH=/path/to/chrome make frontend-test
+~~~
+
+`frontend-test` is explicit opt-in and is not part of `make test` or the default
+GitHub build/release workflows. Without `GPU_EXTJS_PATH` it prints a skip reason;
+with that variable set, missing dependencies or failed assertions fail the target.
+The removed source-text assertions are not equivalent to browser behavior coverage.
+This isolated suite does not cover every GPU feature or replace `make e2e-test`
+against a real, dedicated PVE test node before production deployment.
+
+The visible GPU panel reconciles full SR-IOV policy at most once per 15 seconds
+between explicit actions; VF assignment always requests fresh state first.
+Background reconciliation failures are silent. User-requested assignment reads
+show loading and report failed, empty or superseded responses explicitly.
+Installed frontend cache keys derive from the JavaScript content SHA-256.
+
 t/12-ats-policy.t covers GRUB/proxmox-boot-tool ownership and rollback plus the
 boot binder gate. t/13-native-ats-guard.t covers affected-device identity,
 active/future ATS policy, full hostpci preflight, and marker replay/removal.

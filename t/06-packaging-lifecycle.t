@@ -9,6 +9,7 @@ use File::Temp qw(tempdir);
 
 my $root = File::Spec->rel2abs(File::Spec->catdir(dirname(__FILE__), '..'));
 my $patch_script = File::Spec->catfile($root, 'src', 'scripts', 'reapply-patches.sh');
+$ENV{PVE_GPU_PLUGIN_JS} = File::Spec->catfile($root, 'src', 'js', 'pve-gpu-plugin.js');
 
 sub slurp {
     my ($path) = @_;
@@ -458,8 +459,6 @@ ok(-x $patch_script, 'marker patch script is executable');
     my $patched_hardware = slurp($hardware);
     is(occurrences($patched_index, '<!-- BEGIN PVE GPU MANAGER -->'), 1,
         'index contains one owned marker block');
-    is(occurrences($patched_index, '<script src="/pve2/js/pve-gpu-plugin.js?ver=1.1.0-20"></script>'), 1,
-        'index contains one versioned plugin script tag');
     is(occurrences($patched_hardware, '# BEGIN PVE GPU MANAGER HARDWARE '), 3,
         'Hardware.pm contains three owned marker blocks');
     is(occurrences($patched_hardware, 'use PVE::API2::Hardware::GPU;'), 1,
@@ -512,8 +511,6 @@ OLD_BLOCKS
         'upgrade leaves exactly one GPU plugin script tag');
     is(occurrences($patched_index, '<!-- BEGIN PVE GPU MANAGER -->'), 1,
         'upgrade leaves exactly one owned index marker block');
-    like($patched_index, qr/pve-gpu-plugin[.]js[?]ver=1[.]1[.]0-20/,
-        'upgrade installs only the current cache version');
     unlike($patched_index, qr/pve-gpu-plugin[.]js[?]ver=1[.]1[.]0-(?:7|8|9|10)/,
         'upgrade removes every stale versioned plugin reference');
 }
@@ -561,8 +558,6 @@ OLD_BLOCKS
     write_file($nodes, "package PVE::API2::Nodes;\n1;\n");
 
     ok(run_patch_script($index, $hardware, $nodes, '--apply'), 'legacy unmarked install migrates to markers');
-    is(occurrences(slurp($index), '<script src="/pve2/js/pve-gpu-plugin.js?ver=1.1.0-20"></script>'), 1,
-        'legacy index tag is replaced by one versioned tag');
     is(occurrences(slurp($index), '<script src="/pve2/js/pve-gpu-plugin.js"></script>'), 0,
         'legacy unversioned script tag is removed');
     is(occurrences(slurp($hardware), 'use PVE::API2::Hardware::GPU;'), 1,
@@ -746,6 +741,33 @@ OLD_BLOCKS
         'stale pve-xpu-manager postrm helper is absent');
     ok(!-e File::Spec->catfile($root, 'debian', 'pve-xpu-manager.substvars'),
         'stale pve-xpu-manager substvars is absent');
+}
+
+{
+    my $tmp = tempdir(CLEANUP => 1);
+    my $index = "$tmp/index.html.tpl";
+    my $hardware = "$tmp/Hardware.pm";
+    my $nodes = "$tmp/Nodes.pm";
+    my $asset = "$tmp/plugin.js";
+    write_file($index, $index_fixture);
+    write_file($hardware, $hardware_fixture);
+    write_file($nodes, $nodes_fixture);
+    write_file($asset, 'first asset');
+    local $ENV{PVE_GPU_PLUGIN_JS} = $asset;
+    ok(run_patch_script($index, $hardware, $nodes, '--apply'), 'apply first asset');
+    my ($first) = slurp($index) =~ /[?]ver=([a-f0-9]{64})/;
+    ok(defined($first), 'asset URL has a content fingerprint');
+    ok(run_patch_script($index, $hardware, $nodes, '--apply'), 'reapply unchanged asset');
+    my ($same) = slurp($index) =~ /[?]ver=([a-f0-9]{64})/;
+    is($same, $first, 'unchanged asset retains its cache identity');
+    write_file($asset, 'second asset');
+    ok(run_patch_script($index, $hardware, $nodes, '--apply'), 'apply changed asset');
+    my ($changed) = slurp($index) =~ /[?]ver=([a-f0-9]{64})/;
+    isnt($changed, $first, 'changed asset invalidates browser cache without a manual version bump');
+    my $before_missing = slurp($index);
+    unlink($asset) or die "Cannot remove fixture asset: $!";
+    ok(!run_patch_script($index, $hardware, $nodes, '--apply'), 'missing asset rejects apply');
+    is(slurp($index), $before_missing, 'missing asset leaves index unchanged');
 }
 
 done_testing();

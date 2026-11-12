@@ -1,3 +1,17 @@
+pve-gpu-manager (1.1.0-22) stable; urgency=medium
+
+  * Notify parent panels before destroying VF and driver configuration dialogs
+  * Reconcile drift periodically and refresh policy before opening VF assignment
+  * Fingerprint frontend assets by content instead of a manually pinned version
+  * Replace frontend source-pattern assertions with real ExtJS lifecycle coverage
+  * Keep background failures silent and report foreground cancellation or empty data
+  * Prevent stale VF-list responses from overwriting full policy snapshots
+  * Add an opt-in frontend-test target with clock-driven error and race coverage
+  * Silently discard superseded ordinary reads and callbacks after panel destruction
+  * Accept status responses without embedded VFs while retaining policy updates
+
+ -- PVE GPU Manager <pve-gpu@localhost>  Thu, 12 Nov 2026 11:20:00 +0800
+
 pve-gpu-manager (1.1.0-21) stable; urgency=medium
 
   * Read live Windows GPU Engine counters once per running VF VM through QGA

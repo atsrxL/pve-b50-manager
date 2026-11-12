@@ -299,6 +299,7 @@ QEMUSERVER
 sub run_patch {
     local %ENV = %ENV;
     $ENV{PVE_GPU_INDEX_TPL} = $fixture{index};
+    $ENV{PVE_GPU_PLUGIN_JS} = File::Spec->catfile($src, 'js', 'pve-gpu-plugin.js');
     $ENV{PVE_GPU_HARDWARE_PM} = $fixture{hardware};
     $ENV{PVE_GPU_NODES_PM} = $fixture{nodes};
     $ENV{PVE_GPU_QEMU_PCI_PM} = $fixture{qemu};
